@@ -271,87 +271,58 @@ date_frame  = select(cohort, patient_id, joined_hosp_id, ends_with("dttm"))
 
 ## vasopressors ----------------------------------------------------------------
 
+## vasoactives -----------------------------------------------------------------
 
-
-### tally for inclusion flow diagram -------------------------------------------
-
-fig_s01_01ca = fsubset(cohort, ca_01 == 1) |> select(joined_hosp_id) |> fnunique()
-fig_s01_01no = fsubset(cohort, ca_01 == 0) |> select(joined_hosp_id) |> fnunique()
-
-rm(diagnosis_priority, dx_enc, dx); gc()
-
-
-
-## time starts at the first ward moment ----------------------------------------
-
-cohort = join(cohort, first_ward, how = "left", multiple = F)
-
-## enforce no outcomes before first score --------------------------------------
-
-### early deaths are already covered by no LOS < 6h...
-
-### identify first icu times ---------------------------------------------------
-
-icu = 
-  dplyr::filter(data_list$adt, hospitalization_id %in% cohort_hids) |>
-  dplyr::filter(tolower(location_category) == "icu") |>
-  dplyr::select(hospitalization_id, in_dttm) |>
-  dplyr::collect()
-
-icu = 
-  join(icu, hid_jid_crosswalk, how = "inner", multiple = T) |>
-  roworder(in_dttm) |>
-  fgroup_by(joined_hosp_id) |>
-  fsummarize(itime = ffirst(in_dttm))
-
-### is the first ICU time within 6h of admission_dttm? -------------------------
-
-icu = 
-  join(icu, cohort, how = "inner", multiple = F) |>
-  fsubset(itime < first_ward_dttm + lubridate::dhours(6)) |>
-  fselect(joined_hosp_id) |>
-  tibble::deframe()
-
-### apply exclusion to cohort --------------------------------------------------
-
-cohort       = fsubset(cohort, !joined_hosp_id %in% icu)
-cohort       = fsubset(cohort, discharge_dttm >= first_ward_dttm + lubridate::dhours(min_ward_hours))
-cohort_pats  = funique(cohort$patient_id)
-cohort_jids  = funique(cohort$joined_hosp_id)
-cohort_hids  = funique(hid_jid_crosswalk$hospitalization_id)
-date_frame   = select(cohort, patient_id, joined_hosp_id, ends_with("dttm"))
-fig_s01_05ca = fsubset(cohort, ca_01 == 1 & ed_admit_01 == 1) |> select(joined_hosp_id) |> fnunique()
-fig_s01_05no = fsubset(cohort, ca_01 == 0 & ed_admit_01 == 1) |> select(joined_hosp_id) |> fnunique()
-
-rm(icu); gc()
-
-## save data for inclusion flow diagram ----------------------------------------
-
-step_labels = c(
-  "Adult inpatient admissions during study period",
-  "After excluding patients not admitted through the ED",
-  "After excluding patients who were in the ICU before hitting the wards",
-  "After excluding encounters with < 6h data",
-  "After excluding encounters with outcomes too early"
+vlist = c(
+  "norepinephrine", 
+  "vasopressin"
 )
 
-n_remaining_ca = c(fig_s01_01ca, fig_s01_02ca, fig_s01_03ca, fig_s01_04ca, fig_s01_05ca)
-n_remaining_no = c(fig_s01_01no, fig_s01_02no, fig_s01_03no, fig_s01_04no, fig_s01_05no)
-n_excluded_ca  = c(NA, diff(n_remaining_ca) * -1)
-n_excluded_no  = c(NA, diff(n_remaining_no) * -1)
+va = 
+  dplyr::filter(data_list$medication_admin_continuous, med_category %in% vlist) |>
+  dplyr::filter(hospitalization_id %in% cohort_hids) |>
+  dplyr::select(
+    hospitalization_id, 
+    admin_dttm, 
+    med_category, 
+    strength, 
+    med_dose,
+    med_dose_unit,
+    mar_action_category
+  ) |>
+  dplyr::collect() |>
+  funique()
 
-flow_df = tidytable(
-  step = step_labels, 
-  n_remaining_ca,
-  n_excluded_ca,
-  n_remaining_no,
-  n_excluded_no,
-) 
+va = 
+  join(va, hid_jid_crosswalk, how = "inner", multiple = T) |>
+  join(date_frame,            how = "inner", multiple = T) |>
+  fsubset(admin_dttm >= admission_dttm) |>
+  fsubset(admin_dttm <= discharge_dttm) |>
+  fsubset() |> # make sure med is GOING
+  ftransform(admin_dttm = lubridate::floor_date(admin_dttm, unit = "hours")) |>
+  ftransform() |> # update dose units if need be
+  fgroup_by(joined_hosp_id, admin_dttm, med_category) |>
+  fsummarize(med_dose = fmax(med_dose)) |>
+  pivot_wider(names_from = med_category, values_from = med_dose)
 
-fwrite(flow_df, here("proj_output", paste0("figure_s01_flow_", site_lowercase, ".csv")))
+va = fsubset(va, !is.na(vasopressin))
+va = fsubset(va, norepinephrine >= 0.2)
 
-rm(flow_df, step_labels, n_remaining_ca, n_remaining_no, n_excluded_ca, n_excluded_no)
-gc()
+cohort_jids       = funique(va$joined_hosp_id)
+cohort            = fsubset(cohort, joined_hosp_id %in% cohort_jids)
+hid_jid_crosswalk = fsubset(hid_jid_crosswalk, joined_hosp_id %in% cohort_jids)
+cohort_hids       = funique(hid_jid_crosswalk$hospitalization_id)
+cohort_pats       = funique(cohort$patient_id)
+date_frame        = select(cohort, patient_id, joined_hosp_id, ends_with("dttm"))
+
+## time starts at the moment vasopressor requirements are met ------------------
+
+time_0 = 
+  roworder(va, admin_dttm) |>
+  fgroup_by(joined_hosp_id) |>
+  fsummarize(time_0 = ffirst(admin_dttm))
+
+cohort = join(cohort, time_0, how = "left", multiple = F)
 
 # prepare additional cohort details --------------------------------------------
 
@@ -404,8 +375,12 @@ codes =
   join(cohort, codes, how = "left", multiple = T) |>
   fsubset(start_dttm >= admission_dttm - lubridate::ddays(1)) |>
   fsubset(start_dttm <= discharge_dttm) |>
-  roworder(start_dttm) |>
-  fgroup_by(joined_hosp_id) |>
+  roworder(start_dttm) 
+
+events = select(codes, patient_id, event_dttm = start_dttm, event = code_status_category)
+
+codes = 
+  fgroup_by(codes, joined_hosp_id) |>
   fsummarize(initial_code_status = ffirst(code_status_category)) |>
   fmutate(initial_code_status = if_else(tolower(initial_code_status) == "dnr", "Special/Partial", initial_code_status))
 
@@ -504,11 +479,6 @@ df_outcomes =
   select(joined_hosp_id, starts_with("outcome"))
 
 fwrite(df_outcomes, here("proj_tables", "outcome_times.csv"))
-
-ward_icu_tx = 
-  fsubset(df_outcomes, outcome_cat == "icu") |>
-  fselect(joined_hosp_id) |>
-  tibble::deframe()
 
 rm(df_outcomes, death, hospice, icu); gc()
 
