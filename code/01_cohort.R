@@ -390,64 +390,12 @@ rm(codes); gc()
 
 # outcomes ---------------------------------------------------------------------
 
-## icu admissions --------------------------------------------------------------
-
-### icu data from arrow table --------------------------------------------------
-
-icu = 
-  dplyr::filter(data_list$adt, hospitalization_id %in% cohort_hids) |>
-  dplyr::select(hospitalization_id, in_dttm, location_category) |>
-  dplyr::arrange(in_dttm) |>
-  dplyr::collect() |>
-  funique()
-
-### link to joined_hosp_id -----------------------------------------------------
-
-icu = 
-  join(icu, hid_jid_crosswalk, how = "left",  multiple = T) |>
-  fselect(joined_hosp_id, in_dttm, location_category) |>
-  funique() |>
-  join(date_frame, how = "inner", multiple = T) |>
-  fsubset(in_dttm >= admission_dttm & in_dttm <= discharge_dttm) |>
-  fmutate(location_category = tolower(location_category))
-
-### set aside all icu encounters -----------------------------------------------
-
-icu_encs = 
-  fsubset(icu, location_category == "icu") |>
-  fselect(joined_hosp_id) |>
-  funique() |>
-  tibble::deframe()
-
-### identify ward-icu transfer moments -----------------------------------------
-
-icu = 
-  roworder(icu, in_dttm) |>
-  # avoid categorizing radiology/dialysis/other as the event before ward
-  fsubset(tolower(location_category) %in% c('icu', 'ward')) |>
-  group_by(joined_hosp_id) |>
-  mutate(prev_loc = lag(location_category)) |>
-  mutate(ward_icu = tolower(location_category) == "icu" & tolower(prev_loc) == "ward") |>
-  ungroup() |>
-  fsubset(ward_icu)
-
-### first ward-icu transfer ----------------------------------------------------
-
-icu = 
-  roworder(icu, in_dttm) |>
-  fgroup_by(joined_hosp_id) |>
-  fsummarize(event_dttm = ffirst(in_dttm))  |>
-  ftransform(event = "icu") 
-
 ## death -----------------------------------------------------------------------
 
 death = 
   fsubset(cohort, dead_01 == 1) |>
   select(joined_hosp_id, event_dttm = discharge_dttm) |>
   fmutate(event = "death") 
-
-#### don't need to specify death on wards, 
-#### because if it occurs before ICU it must be
 
 ## hospice ---------------------------------------------------------------------
 
@@ -456,42 +404,17 @@ hospice =
   select(joined_hosp_id, event_dttm = discharge_dttm) |>
   fmutate(event = "hospice") 
 
-## outcomes data frame ---------------------------------------------------------
-
-df_outcomes = 
-  rowbind(icu, death, hospice) |>
-  pivot_wider(
-    names_from   = event,
-    values_from  = event_dttm,
-    names_prefix = "time_"
-  ) |>
-  fmutate(end_enc              = pmin(time_death, time_hospice, na.rm = T)) |>
-  fmutate(outcome_dttm         = pmin(time_icu,   end_enc,      na.rm = T)) |>
-  fmutate(outcome_nohospc_dttm = pmin(time_icu,   time_death,   na.rm = T)) |>
-  fmutate(
-    outcome_cat = case_when(
-      outcome_dttm == time_icu     ~ "icu",
-      outcome_dttm == time_death   ~ "death",
-      outcome_dttm == time_hospice ~ "hospice",
-      TRUE                         ~ "problem"
-    )
-  ) |>
-  select(joined_hosp_id, starts_with("outcome"))
-
-fwrite(df_outcomes, here("proj_tables", "outcome_times.csv"))
-
-rm(df_outcomes, death, hospice, icu); gc()
-
-# other care processes --------------------------------------------------------#
-
-### vasopressors ---------------------------------------------------------------
+## vasopressors ----------------------------------------------------------------
 
 va_list = c(
   "norepinephrine",
   "vasopressin",
   "phenylephrine",
   "epinephrine",
-  "dopamine"
+  "dopamine",
+  "angiotensin_2",
+  "dobutamine",
+  "milrinone"
 )
 
 meds = 
@@ -499,16 +422,22 @@ meds =
   dplyr::select(hospitalization_id, admin_dttm, ends_with("category")) |>
   dplyr::collect() |>
   join(hid_jid_crosswalk, how = "inner", multiple = T) |>
-  fselect(joined_hosp_id, admin_dttm, med_category) |>
+  fselect(joined_hosp_id, admin_dttm, med_category, med_dose, mar_action_category) |>
   funique()
 
 meds = 
   join(meds, date_frame, how = "inner", multiple = T) |>
   fsubset(admin_dttm >= admission_dttm) |>
   fsubset(admin_dttm <= discharge_dttm) |>
-  fmutate(med_category = tolower(med_category)) |>
-  fmutate(event = "vasopressor") |>
-  select(joined_hosp_id, event_dttm = admin_dttm, event, med_category) |>
+  fmutate(
+    med_category = tolower(med_category),
+    event = case_when(
+      med_category == "dobutamine" ~ "inotrope",
+      med_category == "milrinone"  ~ "inotrope",
+      TRUE                         ~ "vasopressor"
+    )
+  )|>
+  select(joined_hosp_id, event_dttm = admin_dttm, event, med_category) |> # needs adjusting to include dosage
   funique()
 
 rm(va_list); gc()
@@ -556,22 +485,18 @@ gc()
 
 ### combine and save -----------------------------------------------------------
 
+## outcomes data frame ---------------------------------------------------------
+
+df_outcomes = rowbind(events, death, hospice, meds, resp) 
+
+fwrite(df_outcomes, here("proj_tables", "outcome_times.csv"))
+
+rm(df_outcomes, death, hospice, events); gc()
+
 rowbind(meds, resp, fill = T) |> 
   write_parquet(here("proj_tables", "careprocess.parquet"))
 
 ## cohort (1 row per encounter) ------------------------------------------------
-
-va_encs  = 
-  fsubset(meds, event == "vasopressor") |>
-  select(joined_hosp_id) |>
-  funique() |>
-  tibble::deframe()
-
-imv_encs = 
-  fsubset(resp, event == "imv") |>
-  select(joined_hosp_id) |>
-  funique() |>
-  tibble::deframe()
 
 cohort = 
   funique(cohort) |>
@@ -692,140 +617,5 @@ if (
 
 write_parquet(cohort,            here("proj_tables", "cohort.parquet"))
 write_parquet(hid_jid_crosswalk, here("proj_tables", "hid_jid_crosswalk.parquet"))
-
-# t02. characteristics/outcomes by cancer status (0 = none, 1 = cancer) --------
-
-## prepare table component = continuous variables ------------------------------
-
-t2_cont = 
-  fsubset(cohort, ed_admit_01 == 1) |>
-  fgroup_by(ca_01) |>
-  fsummarize(
-    n         = fnobs(joined_hosp_id),
-    age_sum   = fsum(age),
-    age_sumsq = fsum(age^2),
-    age_p025  = fquantile(age, 0.025),
-    age_p975  = fquantile(age, 0.975),
-    vw_sum    = fsum(vw),
-    vw_sumsq  = fsum(vw^2),
-    los_sum   = fsum(los_hosp_d),
-    los_sumsq = fsum(los_hosp_d^2),
-    los_p025  = fquantile(los_hosp_d, 0.025),
-    los_p975  = fquantile(los_hosp_d, 0.975)
-  ) |>
-  ftransform(var_type = "continuous") |>
-  ftransform(site     = paste0(site_lowercase))
-
-## prepare table component = categorized continuous variables ------------------
-
-### age ------------------------------------------------------------------------
-
-age_breaks = c( 18,      40,      50,      60,      70,      80,  Inf)
-age_labs   = c("18_39", "40_49", "50_59", "60_69", "70_79", "80_plus")
-
-ages_cat = 
-  fsubset(cohort, ed_admit_01 == 1) |>
-  fselect(ca_01, age) |>
-  fmutate(a = cut(age, breaks = age_breaks, labels = age_labs, right = F)) |>
-  fgroup_by(ca_01, a) |>
-  fnobs() |>
-  select(ca_01, age_cat = a, n = age) |>
-  ftransform(age_cat = paste0("age_", age_cat)) |>
-  ftransform(var = "age", category = str_remove(age_cat, "age_")) |>
-  fselect(ca_01, var, category, n) 
-
-### elixhauser -----------------------------------------------------------------
-
-elix_breaks = c(-Inf,  0, 4,  9, 14,  Inf)
-elix_labs   = c("<= 0", "1-4", "5-9", "10-14", ">= 15")
-
-elix_cat = 
-  fsubset(cohort, ed_admit_01 == 1) |>
-  fselect(ca_01, vw) |>
-  fmutate(a = cut(vw, breaks = elix_breaks, labels = elix_labs, right = F)) |>
-  fgroup_by(ca_01, a) |>
-  fnobs() |>
-  select(ca_01, elix_cat = a, n = vw) |>
-  ftransform(elix_cat = paste0("vw_", elix_cat)) |>
-  ftransform(var = "vw", category = str_remove(elix_cat, "vw_")) |>
-  fselect(ca_01, var, category, n) 
-
-### los (days) -----------------------------------------------------------------
-
-l_breaks = c( 0,        2,         4,         7,         14, Inf)
-l_labs   = c("0-47h", "48h_96h", "96h_1wk", "1wk_2wk", "2wk_plus")
-
-los_cat = 
-  fsubset(cohort, ed_admit_01 == 1) |>
-  fselect(ca_01, los_hosp_d) |>
-  fmutate(los_cat = cut(los_hosp_d, breaks = l_breaks, labels = l_labs, right = F)) |>
-  fgroup_by(ca_01, los_cat) |>
-  fnobs() |>
-  select(ca_01, los_cat, n = los_hosp_d) |>
-  ftransform(var = "los", category = los_cat) |>
-  fselect(ca_01, var, category, n) 
-
-## prepare table component = categorical variables -----------------------------
-
-t2_cat = 
-  fsubset(cohort, ed_admit_01 == 1) |>
-  select(-ends_with("id"), -ends_with("dttm"),  -age, -vw, -los_hosp_d) |>
-  pivot_longer(-ca_01, names_to = "var", values_to = "val") |>
-  fsubset(!is.na(val)) |>
-  fmutate(n = val) |>
-  fgroup_by(ca_01, var, val) |>
-  fnobs() |>
-  ftransform(var      = str_remove(var, "_01")) |>
-  ftransform(category = tolower(str_replace_all(as.character(val), "-", "_"))) |>
-  fselect(ca_01, var, category, n) 
-
-## quality control -------------------------------------------------------------
-
-### check for small n in cells -------------------------------------------------
-
-ages_cat$site = site_lowercase
-elix_cat$site = site_lowercase
-los_cat$site  = site_lowercase
-t2_cat$site   = site_lowercase
-
-all_cat = rowbind(ages_cat, elix_cat, los_cat, t2_cat)
-small_c = fsubset(all_cat, n < 5 & n > 0)
-
-if (nrow(small_c) > 0) {
-  msg = paste0(
-    "ERROR: ", nrow(small_c), " cells have n < 5:\n",
-    capture.output(print(small_c |> fselect(var, category, ca_01, n))) |> 
-      paste(collapse = "\n")
-  )
-  stop(msg)
-}
-
-### check for sample size mismatch in continuous table -------------------------
-
-if (sum(t2_cont$n) != nrow(cohort[ed_admit_01 == 1])) {
-  stop("ERROR: Sample size mismatch! Sum of t2_cont$n != nrow(df)")
-}
-
-## export table 2 --------------------------------------------------------------
-
-fwrite(all_cat, here("proj_output", paste0("table_02_cat_",  site_lowercase, ".csv")))
-fwrite(t2_cont, here("proj_output", paste0("table_02_cont_", site_lowercase, ".csv")))
-
-# final cleanup ----------------------------------------------------------------
-
-keep = c(
-  "data_list",
-  "site_lowercase",
-  "cohort",
-  "cohort_hids",
-  "cohort_jids",
-  "cohort_pats",
-  "hid_jid_crosswalk",
-  "ward_times",
-  "req_vitals",
-  "req_labs"
-)
-
-rm(list = setdiff(ls(), keep)); gc()
 
 # go to 02
