@@ -1,102 +1,41 @@
 
 
+# Requires data_list to be loaded/validated from 00_*
 
-# Setup script for CLIF project evaluating vasopressor use patterns
+# resources for RAM heavy wrangling --------------------------------------------
 
-# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+## cores & RAM (reuse from 00 if available) ------------------------------------
 
-# setup ------------------------------------------------------------------------
+os_type   = if (exists("os_type"))   os_type   else Sys.info()[["sysname"]]
+all_cores = if (exists("all_cores")) all_cores else {
+  x = parallel::detectCores(logical = TRUE); if (is.na(x)) 1L else as.integer(x)
+}
 
-## libraries -------------------------------------------------------------------
-
-packages_to_install =
-  c(
-    "comorbidity",
-    "data.table",
-    "tidyverse",
-    "tidytable",
-    "collapse",
-    "janitor",
-    "readxl",
-    "arrow",
-    "rvest", 
-    "readr", 
-    "yaml",
-    "here",
-    "fst"
-  )
-
-packages_to_load = 
-  c(
-    "data.table",
-    "tidytable",
-    "collapse",
-    "stringr",
-    "arrow",
-    "here"
-  )
-
-fn_install_if_mi = function(p) {
-  if (!requireNamespace(p, quietly = TRUE)) {
-    try(install.packages(p, dependencies = TRUE), silent = TRUE)
+if (!exists("avail_ram_gb") || !is.finite(avail_ram_gb)) {
+  get_ram_gb = function() {
+    tryCatch({
+      if (Sys.info()[["sysname"]] == "Darwin") {
+        bytes = suppressWarnings(as.numeric(system("sysctl -n hw.memsize", intern = TRUE)))
+        if (length(bytes) > 0 && !is.na(bytes)) bytes / 1024^3 else NA_real_
+      } else if (file.exists("/proc/meminfo")) {
+        kb = suppressWarnings(as.numeric(system("awk '/MemAvailable/ {print $2}' /proc/meminfo", intern = TRUE)))
+        if (length(kb) > 0 && !is.na(kb)) kb / 1024^2 else NA_real_
+      } else if (requireNamespace("ps", quietly = TRUE)) {
+        ps::ps_system_memory()[["available"]] / 1024^3
+      } else NA_real_
+    }, error = function(e) NA_real_)
   }
+  avail_ram_gb = get_ram_gb()
 }
 
-fn_load_quiet = function(p) {
-  suppressPackageStartupMessages(library(p, character.only = TRUE))
-}
+## choose threads (2 GB per thread; leave 1 core free) -------------------------
 
-invisible(lapply(packages_to_install, fn_install_if_mi))
-invisible(lapply(packages_to_load,   fn_load_quiet))
-options(dplyr.summarise.inform = FALSE)
-rm(packages_to_install, packages_to_load, fn_install_if_mi, fn_load_quiet); gc()
-
-## environment -----------------------------------------------------------------
-
-### threads and ram ------------------------------------------------------------
-
-os_type   = Sys.info()[["sysname"]]
-all_cores = parallel::detectCores(logical = TRUE)
-all_cores = if (is.na(all_cores)) 1L else as.integer(all_cores)
-
-get_ram_gb = function() {
-  tryCatch({
-    if (os_type == "Darwin") {
-      # macOS: sysctl reports total RAM in bytes
-      bytes = suppressWarnings(
-        as.numeric(system("sysctl -n hw.memsize", intern = TRUE))
-      )
-      if (length(bytes) > 0 && !is.na(bytes)) bytes / 1024^3 else NA_real_
-    } else {
-      # Windows & Linux: ps is usually reliable
-      mem_info = ps::ps_system_memory()
-      key      = intersect(c("available", "avail"), names(mem_info))
-      val      = if (length(key) > 0) mem_info[[key]] / 1024^3 else NA_real_
-      if (is.finite(val)) val else {
-        # Linux fallback: read /proc/meminfo directly
-        if (file.exists("/proc/meminfo")) {
-          kb = suppressWarnings(
-            as.numeric(system("awk '/MemAvailable/ {print $2}' /proc/meminfo", intern = TRUE))
-          )
-          if (length(kb) > 0 && !is.na(kb)) kb / 1024^2 else NA_real_
-        } else {
-          NA_real_
-        }
-      }
-    }
-  }, error = function(e) NA_real_)
-}
-
-avail_ram_gb = get_ram_gb()
-
-## choose threads conservatively (00 is light; keep headroom) ------------------
-
-reserve_cores   = 1L
-gb_per_thread   = 0.50
-max_by_cores    = max(1L, all_cores - reserve_cores)
-max_by_memory   = if (is.finite(avail_ram_gb)) max(1L, floor(avail_ram_gb / gb_per_thread)) else max_by_cores
-n_threads       = as.integer(max(1L, min(max_by_cores, max_by_memory, 8L)))
-n_math_threads  = as.integer(max(1L, min(n_threads, 8L)))
+reserve_cores  = 1L
+gb_per_thread  = 2.0
+max_by_cores   = max(1L, all_cores - reserve_cores)
+max_by_memory  = if (is.finite(avail_ram_gb)) max(1L, floor(avail_ram_gb / gb_per_thread)) else max_by_cores
+n_threads      = as.integer(max(1L, min(max_by_cores, max_by_memory)))
+n_math_threads = as.integer(max(1L, min(n_threads, 8L)))
 
 ## apply thread settings -------------------------------------------------------
 
@@ -106,387 +45,612 @@ options(arrow.use_threads        = TRUE)
 Sys.setenv(ARROW_NUM_THREADS     = n_threads)
 options(mc.cores                 = n_threads)
 
-# concise summary
 message(
-  sprintf("Env OK | OS=%s | Cores=%d | Threads=%d | MathThreads=%d | Avail RAM≈%s GB",
+  sprintf("01 resources | OS=%s | Cores=%d | Threads=%d | MathThreads=%d | Avail RAM≈%s GB (rule: 2 GB/core)",
           os_type, all_cores, n_threads, n_math_threads,
           ifelse(is.finite(avail_ram_gb), round(avail_ram_gb, 1), "NA"))
 )
 
-### site details ---------------------------------------------------------------
-
-config        = yaml::read_yaml(here("config", "config_clif_pressors.yaml"))
-site_details  = fread(here("config", "clif_sites.csv"))
-allowed_sites = tolower(site_details$site_name)
-allowed_files = c("parquet", "csv", "fst")
-
-### user enters site details ---------------------------------------------------
-
-site_lowercase   = tolower(config$site_lowercase)
-file_type        = tolower(config$file_type)  
-tables_location  = config$clif_data_location # here("../_clif_data/v_2.1") 
-project_location = config$project_location
-
-### site_name must be a valid clif site in lowercase ---------------------------
-
-if (!(site_lowercase %in% allowed_sites)) {
-  stop(
-    paste0(
-      "Invalid '", site_lowercase,
-      "'. Expected one of: ", 
-      paste(allowed_sites, collapse = ", "), call. = F
-    )
-  )
-}
-
-### file_type must be one of c(parquet, csv, fst) ------------------------------
-
-if (!(file_type %in% allowed_files)) {
-  stop(
-    paste0(
-      "Invalid '", file_type,
-      "'. Expected one of: ", 
-      paste(allowed_files, collapse = ", "), call. = FALSE
-    )
-  )
-}
-
-### pull time zone from site details -------------------------------------------
-
-# site_time_zone = 
-#   fsubset(site_details, site_name == site_lowercase) |>
-#   select(tz) |>
-#   tibble::deframe()
-
-### file locations -------------------------------------------------------------
-
-if (!dir.exists(paste0(project_location, "/proj_tables"))) {
-  dir.create(paste0(project_location, "/proj_tables"))
-}
-if (!dir.exists(paste0(project_location, "/proj_output"))) {
-  dir.create(paste0(project_location, "/proj_output"))
-}
-
-### dates ----------------------------------------------------------------------
-
-start_date = as.POSIXct("2016-01-01", tz = "UTC") # could be site_time_zone if we care...
-end_date   = as.POSIXct("2024-12-31", tz = "UTC") # could be site_time_zone if we care...
-today      = format(Sys.Date(), "%y%m%d")
-
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
 
-# data -------------------------------------------------------------------------
+# cohort identification --------------------------------------------------------
 
-## clif tables needed for project ----------------------------------------------
+## start by linking contiguous hospitalizations --------------------------------
 
-required_tables = 
-  c(
-    "patient", 
-    "hospital_diagnosis",
-    "hospitalization", 
-    "adt", 
-    "vitals", 
-    "labs", 
-    "medication_admin_continuous", 
-    "respiratory_support",
-    "code_status",
-    "patient_assessments"
-  )
+### encounters with age >= 18 and dates within study window --------------------
 
-## check required tables against available tables ------------------------------
+hosp_blocks = 
+  dplyr::filter(data_list$hospitalization, age_at_admission >= 18) |>
+  dplyr::filter(admission_dttm >= start_date & admission_dttm <= end_date) |> 
+  dplyr::filter(admission_dttm < discharge_dttm & !is.na(discharge_dttm)) |>
+  dplyr::select(patient_id, hospitalization_id, admission_dttm, discharge_dttm) |>
+  dplyr::collect() |>
+  roworder(patient_id, admission_dttm)
 
-clif_table_filenames = 
-  list.files(
-    path       = tables_location, 
-    pattern    = paste0("^clif_.*\\.", file_type, "$"), 
-    full.names = TRUE
-  )
+### use data.table to find joined hospitalizations with <= 6h gaps -------------
 
-clif_table_basenames = 
-  basename(clif_table_filenames) |>
-  str_remove(paste0("\\.", file_type, "$")) |> # remove extension
-  str_remove("^clif_") |>                      # remove leading 'clif_'
-  str_remove("(_\\d{4}(_\\d{4})*)$")           # remove any date ranges in file name
+link_hours = 6L
+linked     = as.data.table(hosp_blocks)
+setorder(linked, patient_id, admission_dttm)
 
-table_file_map     = setNames(clif_table_filenames, clif_table_basenames)
-missing_tables     = setdiff(required_tables, clif_table_basenames)
-required_filenames = table_file_map[required_tables]
+#### calculate gaps between encounters
+linked[, next_admit := shift(admission_dttm, type = "lead"), by = patient_id]
+linked[, next_gap   := as.numeric(difftime(next_admit, discharge_dttm, units = "hours"))]
+linked[, prev_dc    := shift(discharge_dttm, type = "lag"), by = patient_id]  
+linked[, prev_gap   := as.numeric(difftime(admission_dttm, prev_dc, units = "hours"))]
 
-if (length(missing_tables) > 0) {
-  stop(paste("Error: Missing required tables:", paste(missing_tables, collapse = ", ")))
-} else {
-  message("All required tables are present.")
-}
+#### mark encounters that should be linked
+linked[, link_flag := (next_gap < link_hours | prev_gap < link_hours)]
+linked[is.na(link_flag), link_flag := FALSE]
 
-rm(site_details, allowed_files, allowed_sites, missing_tables); gc()
+#### create unique joined hospitalization ID, new group whenever gap > link_hours from  previous discharge
+linked[, new_group := is.na(prev_gap) | prev_gap >= link_hours]
+linked[, joined_hosp_id := .GRP, by = .(patient_id, cumsum(new_group))]
 
-## load tables -----------------------------------------------------------------
+#### create hid_jid_crosswalk --------------------------------------------------
+hid_jid_crosswalk = select(linked, ends_with("id")) |> as_tidytable()
 
-if (file_type == "parquet") {
-  data_list = lapply(required_filenames, open_dataset)
-} else if (file_type == "csv") {
-  data_list = lapply(required_filenames, \(f) read_csv_arrow(f))
-} else if (file_type == "fst") {
-  data_list = lapply(required_filenames, \(f) {
-    tmp = read.fst(f, as.data.table = TRUE)
-    arrow_table(tmp)
-  })
-} else {
-  stop("Unsupported file format")
-}
+## hospital ward admissions ----------------------------------------------------
 
-names(data_list) = names(required_filenames)
+### stay requires ed or icu ----------------------------------------------------
 
-## validate table contents -----------------------------------------------------
+inpatient_hids = 
+  dplyr::filter(data_list$adt, tolower(location_category) %in% c("ed", "icu")) |>
+  dplyr::select(hospitalization_id) |>
+  dplyr::collect() |>
+  funique() |>
+  tibble::deframe()
 
-### function to validate a table -----------------------------------------------
-## validate table contents -----------------------------------------------------
+inpatient_jids = 
+  fsubset(hid_jid_crosswalk, hospitalization_id %in% inpatient_hids) |>
+  select(joined_hosp_id) |>
+  funique() |>
+  tibble::deframe()
 
-### case-insensitive column resolver -------------------------------------------
+### don't want to include psych ------------------------------------------------
 
-.resolve <- function(tbl, v) {
-  nm = names(tbl)
-  nm[match(tolower(v), tolower(nm))]
-}
+drop_ob = 
+  dplyr::filter(data_list$adt, tolower(location_category) %in% c("psych", "rehab")) |>
+  dplyr::select(hospitalization_id) |>
+  dplyr::collect() |>
+  funique() |>
+  tibble::deframe()
 
-### function to validate a table -----------------------------------------------
+drop_ob_jids = 
+  fsubset(hid_jid_crosswalk, hospitalization_id %in% drop_ob) |>
+  select(joined_hosp_id) |>
+  funique() |>
+  tibble::deframe()
 
-validate_table = function(tbl, table_name, req_vars = NULL, req_values = list()) {
-  
-  if (is.null(req_vars)) req_vars = character(0)
-  
-  problems     = character()
-  actual_names = tolower(names(tbl))
-  req_lower    = tolower(req_vars)
-  missing_vars = req_vars[!req_lower %in% actual_names]
-  
-  if (length(missing_vars)) {
-    problems = c(problems, sprintf("Missing required vars: %s", paste(missing_vars, collapse = ", ")))
-  }
-  
-  for (var in names(req_values)) {
-    resolved_var = .resolve(tbl, var)
-    if (is.na(resolved_var)) {
-      problems = c(problems, sprintf("Missing '%s' needed for value checks.", var))
-      next
-    }
-    
-    ### special handling for FileSystemDataset
-    if (inherits(tbl, "FileSystemDataset")) {
-      present_vals = character(0)
-      tryCatch({
-        value_counts =
-          dplyr::select(tbl, !!rlang::sym(resolved_var)) |>
-          dplyr::group_by(!!rlang::sym(resolved_var)) |>
-          dplyr::summarize(n = dplyr::n()) |>
-          dplyr::arrange(dplyr::desc(n)) |>
-          dplyr::collect()
-        if (nrow(value_counts) > 0) {
-          present_vals = na.omit(as.character(value_counts[[resolved_var]]))
-        }
-      }, error = function(e) { })
-      
-      if (length(present_vals) == 0) {
-        tryCatch({
-          sample_data =
-            dplyr::select(tbl, !!rlang::sym(resolved_var)) |>
-            utils::head(1000) |>
-            dplyr::collect()
-          if (nrow(sample_data) > 0) {
-            present_vals = na.omit(unique(as.character(sample_data[[resolved_var]])))
-          }
-        }, error = function(e) { })
-      }
-    } else if (!is.data.frame(tbl) && inherits(tbl, "Table")) {
-      present_vals = character(0)
-      tryCatch({
-        distinct_vals = tbl |>
-          dplyr::select(!!rlang::sym(resolved_var)) |>
-          dplyr::distinct() |>
-          dplyr::collect()
-        if (nrow(distinct_vals) > 0) {
-          present_vals = na.omit(as.character(distinct_vals[[resolved_var]]))
-        }
-      }, error = function(e) { })
-    } else {
-      present_vals = na.omit(unique(as.character(tbl[[resolved_var]])))
-    }
-    
-    present_vals  = tolower(trimws(as.character(present_vals)))
-    expected_vals = unique(tolower(trimws(req_values[[var]])))
-    missing_vals  = setdiff(expected_vals, present_vals)
-    
-    if (length(missing_vals)) {
-      problems = c(
-        problems,
-        sprintf("Variable '%s' is missing expected values: %s", var, paste(missing_vals, collapse = ", "))
-      )
-    }
-  }
-  
-  if (length(problems)) {
-    return(sprintf("Table '%s':\n- %s", table_name, paste(problems, collapse = "\n- ")))
-  }
-  
-  invisible(NULL)
-}
+linked = fsubset(linked,  joined_hosp_id %in% inpatient_jids) 
+linked = fsubset(linked, !joined_hosp_id %in% drop_ob_jids)
+linked = select(linked, ends_with("id"), ends_with("dttm"))
 
-### function to validate all tables --------------------------------------------
+### an admission requires at least 1 full set of vital signs -------------------
 
-validate_all_tables = function(data_list, validation_specs) {
-  all_problems = character()
-  
-  for (spec in validation_specs) {
-    tbl_name = spec$table_name
-    if (!tbl_name %in% names(data_list)) {
-      all_problems = c(all_problems, sprintf("Table '%s' is missing entirely.", tbl_name))
-      next
-    }
-    
-    tbl = data_list[[tbl_name]]
-    
-    tbl_problems = 
-      validate_table(
-        tbl        = tbl,
-        table_name = tbl_name,
-        req_vars   = spec$req_vars,
-        req_values = spec$req_values
-      )
-    
-    if (!is.null(tbl_problems)) all_problems = c(all_problems, tbl_problems)
-  }
-  
-  if (length(all_problems)) {
-    stop("Validation errors found:\n", paste(all_problems, collapse = "\n\n"), call. = FALSE)
-  }
-  
-  message("✅ Validation passed: all required tables are present and contain needed values.")
-}
+has_vital_signs = 
+  dplyr::filter(data_list$vitals, hospitalization_id %in% inpatient_hids) |>
+  dplyr::filter(vital_category %in% req_vitals) |>
+  dplyr::select(hospitalization_id, vital_category, recorded_dttm) |>
+  dplyr::collect() |>
+  funique() 
 
-### list the details of each table's required elements -------------------------
+has_vital_signs = 
+  join(has_vital_signs, linked, how = "inner", multiple = T) |>
+  fsubset(recorded_dttm >= admission_dttm & recorded_dttm <= recorded_dttm) |>
+  fselect(joined_hosp_id, vital_category) |>
+  funique() |>
+  summarize(n = n(), .by = joined_hosp_id) |>
+  fsubset(n == length(req_vitals)) |>
+  pull(joined_hosp_id) 
 
-#### prep vitals and labs separately, as they're used more than once -----------
+linked            = fsubset(linked, joined_hosp_id %in% has_vital_signs) 
+hid_jid_crosswalk = select(linked, ends_with("id"))
+cohort_hids       = funique(hid_jid_crosswalk$hospitalization_id)
+cohort_pats       = funique(hid_jid_crosswalk$patient_id)
 
-req_vitals = 
-  c(
-    "heart_rate", 
-    "respiratory_rate", 
-    "sbp", 
-    "spo2", 
-    "temp_c"
-  )
+### clean up helpers -----------------------------------------------------------
 
-req_labs = 
-  c(
-    "bilirubin_total",
-    "bun",
-    "creatinine",
-    "hemoglobin",
-    "lactate",
-    "pco2_arterial",
-    "po2_arterial",
-    "ph_arterial",
-    "platelet_count",
-    "so2_arterial",
-    "wbc"
-  )
-
-#### make lists of other tables' validation requirements -----------------------
-
-patient_list = 
-  list(
-    table_name = "patient",
-    req_vars   = c("patient_id", "race_category", "ethnicity_category", "sex_category"),
-    req_values = list(
-      sex_category       = c("Female", "Male"),
-      race_category      = c("White", "Black or African American", "Asian"),
-      ethnicity_category = c("Hispanic", "Non-Hispanic")
-    )
-  )
-
-hosp_list = 
-  list(
-    table_name = "hospitalization",
-    req_vars   = c(
-      "patient_id", 
-      "hospitalization_id", 
-      "age_at_admission", 
-      "admission_dttm", 
-      "discharge_dttm", 
-      "discharge_category"
-    ),
-    req_values = list(discharge_category = c("Hospice", "Expired"))
-  )
-
-adt_list = 
-  list(
-    table_name = "adt",
-    req_vars   = c("hospitalization_id", "hospital_id", "location_category", "in_dttm", "out_dttm"),
-    req_values = list(location_category = c("ed", "icu", "ward"))
-  )
-
-dx_list = list(
-  table_name = "hospital_diagnosis",
-  req_vars   = c("hospitalization_id", "diagnosis_code", "diagnosis_code_format"),
-  req_values = list(diagnosis_code_format = c("ICD10CM"))
-)
-
-med_list = 
-  list(
-    table_name = "medication_admin_continuous",
-    req_vars   = c("med_group", "med_category"),
-    req_values = list(
-      med_group    = c("vasoactives"),
-      med_category = c("norepinephrine", "vasopressin", "epinephrine")
-    )
-  )
-
-resp_list = 
-  list(
-    table_name = "respiratory_support",
-    req_vars   = c("device_category"),
-    req_values = list(device_category = c("IMV"))
-  )
-
-vitals_list = 
-  list(
-    table_name = "vitals",
-    req_vars   = c("vital_category", "vital_value", "recorded_dttm"),
-    req_values = list(vital_category = req_vitals)
-  )
-
-labs_list = 
-  list(
-    table_name = "labs",
-    req_vars   = c("lab_category", "lab_value", "lab_result_dttm"),
-    req_values = list(lab_category = req_labs)
-  )
-
-pa_list = 
-  list(
-    table_name = "patient_assessments",
-    req_vars   = c("assessment_category", "numerical_value", "recorded_dttm"),
-    req_values = list(assessment_category = "gcs_total")
-  )
-
-validation_specs = list(
-  patient_list, 
-  hosp_list, 
-  adt_list, 
-  dx_list,
-  med_list, 
-  resp_list, 
-  vitals_list, 
-  labs_list,
-  pa_list
-)
-
-## run validation functions ----------------------------------------------------
-
-validate_all_tables(data_list, validation_specs)
-
-rm(labs_list, vitals_list, resp_list, med_list, adt_list, dx_list, hosp_list, patient_list, validation_specs)
-rm(clif_table_basenames, clif_table_filenames, required_filenames, required_tables, table_file_map)
+rm(inpatient_hids, inpatient_jids, drop_ob, drop_ob_jids)
+rm(has_vital_signs, hosp_blocks, link_hours)
 gc()
 
-# go to script 01
+## assemble cohort data frame --------------------------------------------------
+
+#### pull additional data for cohort filtering and final variables
+cohort_data = 
+  dplyr::filter(data_list$hospitalization, hospitalization_id %in% cohort_hids) |>
+  dplyr::select(ends_with("id"), age_at_admission, discharge_category) |> 
+  dplyr::collect()
+
+hid_dups_source =
+  fcount(cohort_data, hospitalization_id) |>
+  fsubset(N > 1) 
+
+if (nrow(hid_dups_source) > 0) {
+  stop(
+    sprintf("Source has duplicate hospitalization_id: %s",
+            paste(head(hid_dups_source$hospitalization_id, 50), collapse = ", ")),
+    call. = FALSE
+  )
+}
+
+#### create final cohort - 1 row per joined_hosp_id
+cohort = 
+  join(linked, cohort_data, how = "left", multiple = T) |>
+  roworder(admission_dttm) |>
+  fgroup_by(patient_id, joined_hosp_id) |>
+  fsummarize(
+    age                = ffirst(age_at_admission),
+    admission_dttm     = ffirst(admission_dttm),
+    discharge_dttm     = flast(discharge_dttm),
+    discharge_category = flast(discharge_category)
+  )
+
+#### clean up temporary variables
+rm(linked, cohort_data); gc()
+
+## quality control -------------------------------------------------------------
+
+### check for duplicates -------------------------------------------------------
+
+dupes = cohort |> janitor::get_dupes(patient_id, admission_dttm)
+
+if (nrow(dupes) > 0) {
+  dup_ids = funique(dupes$joined_hosp_id)
+  stop(
+    sprintf("Found %d duplicate joined_hosp_id(s): %s", length(dup_ids), paste(dup_ids, collapse = ", ")),
+    call. = FALSE
+  )
+}
+
+message("✅ No duplicate joined_hosp_id found.")
+
+### YODO (you only die once) ---------------------------------------------------
+
+#### death duplicates ----------------------------------------------------------
+
+dup_deaths = 
+  fsubset(cohort, discharge_category == "Expired") |>
+  roworder(admission_dttm, discharge_dttm) |>
+  fgroup_by(patient_id) |>
+  fmutate(one = 1L) |>
+  fmutate(n_deaths = fsum(one), counter = fcumsum(one)) |>
+  fungroup() |>
+  fsubset(n_deaths > 1) 
+
+if (nrow(dup_deaths) > 0) {
+  
+  encdrop = 
+    fsubset(dup_deaths, counter == 1) |>
+    select(joined_hosp_id) |>
+    tibble::deframe()
+  
+  cohort  = fsubset(cohort, !joined_hosp_id %in% encdrop)
+  n_dupes = sum(dup_deaths$counter > 1)
+  n_pats  = length(unique(dup_deaths$patient_id))
+  
+  message(
+    sprintf("Removed %d duplicate deaths for %d patients: %s",
+            n_dupes, n_pats, paste(unique(dup_deaths$patient_id), collapse = ", "))
+  )
+}
+
+#### readmissions following death ----------------------------------------------
+
+death_times = 
+  fsubset(cohort, tolower(discharge_category) == "expired") |>
+  roworder(discharge_dttm) |>
+  fgroup_by(patient_id) |>
+  fsummarise(death_instant = ffirst(discharge_dttm))
+
+post_death_admissions = 
+  join(cohort, death_times, how = "inner", multiple = T) |>
+  fsubset(admission_dttm >= death_instant) 
+
+if (nrow(post_death_admissions) > 0) {
+  cohort = fsubset(cohort, !joined_hosp_id %in% post_death_admissions$joined_hosp_id)
+  
+  message(
+    sprintf("Removed %d post-death encs for %d patients (? organ donors): %s",
+            nrow(post_death_admissions),
+            length(unique(post_death_admissions$patient_id)),
+            paste(unique(post_death_admissions$patient_id), collapse = ", "))
+  )
+}
+
+message("✅ Cleaned duplicate deaths and post-death encounters.")
+
+rm(dupes, dup_deaths, death_times, post_death_admissions, start_date, end_date)
+rm(encdrop, file_type, n_dupes, n_pats); gc()
+
+cohort_pats = funique(cohort$patient_id)
+cohort_jids = funique(cohort$joined_hosp_id)
+cohort_hids = funique(hid_jid_crosswalk$hospitalization_id)
+date_frame  = select(cohort, patient_id, joined_hosp_id, ends_with("dttm"))
+
+rm(hid_dups_source, pa_list, get_ram_gb, validate_table); gc()
+
+## vasopressors ----------------------------------------------------------------
+
+## vasoactives -----------------------------------------------------------------
+
+vlist = c("norepinephrine", "vasopressin")
+
+va = 
+  dplyr::filter(data_list$medication_admin_continuous, med_category %in% vlist) |>
+  dplyr::filter(hospitalization_id %in% cohort_hids) |>
+  dplyr::select(
+    hospitalization_id, 
+    admin_dttm, 
+    med_category, 
+    strength, 
+    med_dose,
+    med_dose_unit,
+    mar_action_name ## needs to be category
+  ) |>
+  dplyr::collect() |>
+  funique()
+
+va = 
+  join(va, hid_jid_crosswalk, how = "inner", multiple = T) |>
+  join(date_frame,            how = "inner", multiple = T) |>
+  fsubset(admin_dttm >= admission_dttm) |>
+  fsubset(admin_dttm <= discharge_dttm) |>
+  #fsubset() |> # make sure med is GOING
+  ftransform(admin_dttm = lubridate::floor_date(admin_dttm, unit = "hours")) |>
+  #ftransform() |> # update dose units if need be
+  fgroup_by(joined_hosp_id, admin_dttm, med_category, med_dose_unit) |>
+  fsummarize(med_dose = fmax(med_dose)) |>
+  pivot_wider(names_from = med_category, values_from = med_dose)
+
+va = fsubset(va, norepinephrine >= 0.2)
+#va = fsubset(va, !is.na(vasopressin))
+
+cohort_jids       = funique(va$joined_hosp_id)
+cohort            = fsubset(cohort, joined_hosp_id %in% cohort_jids)
+hid_jid_crosswalk = fsubset(hid_jid_crosswalk, joined_hosp_id %in% cohort_jids)
+cohort_hids       = funique(hid_jid_crosswalk$hospitalization_id)
+cohort_pats       = funique(cohort$patient_id)
+date_frame        = select(cohort, patient_id, joined_hosp_id, ends_with("dttm"))
+
+## time starts at the moment vasopressor requirements are met ------------------
+
+time_0 = 
+  roworder(va, admin_dttm) |>
+  fgroup_by(joined_hosp_id) |>
+  fsummarize(time_0 = ffirst(admin_dttm))
+
+cohort = join(cohort, time_0, how = "left", multiple = F)
+
+# prepare additional cohort details --------------------------------------------
+
+## patient demographics --------------------------------------------------------
+
+### pull demographics from arrow table -----------------------------------------
+
+cohort_demographics = 
+  dplyr::filter(data_list$patient, patient_id %in% cohort_pats) |>
+  dplyr::select(patient_id, death_dttm, ends_with("category")) |>
+  dplyr::collect() |>
+  funique()
+
+pt_dups = 
+  fcount(cohort_demographics, patient_id, name = "n") |>
+  fsubset(n > 1) 
+
+if (nrow(pt_dups) > 0) {
+  stop(
+    sprintf("Duplicate patient_id(s): %s", paste(pt_dups$patient_id, collapse = ", ")), call. = F
+  )
+}
+
+cohort_demographics$language_category = case_when(
+  cohort_demographics$language_category == "spanish" ~ "spanish",
+  cohort_demographics$language_category == "english" ~ "english",
+  TRUE                                               ~ "other"
+)
+
+### add demographics to cohort df ----------------------------------------------
+
+cohort = 
+  join(cohort, cohort_demographics, how = "left", multiple = F) |>
+  fmutate(age        = if_else(age > 90, 90.9, age)) |>
+  fmutate(female_01  = if_else(tolower(sex_category) == "female", 1L, 0L)) |>
+  fmutate(dead_01    = if_else(tolower(discharge_category) == "expired", 1L, 0L)) |>
+  fmutate(hospice_01 = if_else(tolower(discharge_category) == "hospice", 1L, 0L)) |>
+  fmutate(los_hosp_d = as.numeric(difftime(discharge_dttm, admission_dttm), "hours")/24) |>
+  mutate(across(
+    .cols = where(is.character) & !any_of("patient_id"),
+    .fns  = ~tolower(.x)
+  )) |>
+  fselect(-sex_category, -discharge_category)
+
+rm(pt_dups, cohort_demographics); gc()
+
+## code status -----------------------------------------------------------------
+
+### get all codes from arrow table ---------------------------------------------
+
+codes = 
+  dplyr::filter(data_list[["code_status"]], patient_id %in% cohort_pats) |>
+  dplyr::select(patient_id, start_dttm, code_status_category) |>
+  dplyr::collect() |>
+  funique()
+
+### set aside all codes for "events" table -------------------------------------
+
+codes = 
+  join(cohort, codes, how = "left", multiple = T) |>
+  fsubset(start_dttm >= admission_dttm - lubridate::ddays(1)) |>
+  fsubset(start_dttm <= discharge_dttm) |>
+  roworder(start_dttm) 
+
+events = select(codes, joined_hosp_id, event_dttm = start_dttm, event = code_status_category)
+
+### identify initial code status -----------------------------------------------
+
+codes = 
+  fgroup_by(codes, joined_hosp_id) |>
+  fsummarize(first_code_status = ffirst(code_status_category)) |>
+  ftransform(first_code_status = if_else(tolower(first_code_status) == "dnr", "special/partial", tolower(first_code_status)))
+
+cohort = join(cohort, codes, how = "left", multiple = F)
+
+rm(codes); gc()
+
+# outcomes ---------------------------------------------------------------------
+
+## death -----------------------------------------------------------------------
+
+death = 
+  fsubset(cohort, dead_01 == 1) |>
+  select(joined_hosp_id, event_dttm = discharge_dttm) |>
+  fmutate(event = "death") 
+
+## hospice ---------------------------------------------------------------------
+
+hospice = 
+  fsubset(cohort, hospice_01 == 1) |>
+  select(joined_hosp_id, event_dttm = discharge_dttm) |>
+  fmutate(event = "hospice") 
+
+## intubation ------------------------------------------------------------------
+
+resp = 
+  dplyr::filter(data_list$respiratory_support, hospitalization_id %in% cohort_hids) |>
+  dplyr::filter(tolower(device_category) == "imv") |>
+  dplyr::select(hospitalization_id, recorded_dttm) |>
+  dplyr::collect() |>
+  join(hid_jid_crosswalk, how = "inner", multiple = T) |>
+  fselect(joined_hosp_id, recorded_dttm) |>
+  funique()
+
+resp = 
+  join(resp, date_frame, how = "inner", multiple = T) |>
+  fsubset(recorded_dttm >= admission_dttm) |>
+  fsubset(recorded_dttm <= discharge_dttm) |>
+  roworder(recorded_dttm) |>
+  fgroup_by(joined_hosp_id) |>
+  fsummarize(event_dttm = ffirst(recorded_dttm)) |>
+  ftransform(event = "imv")
+
+## crrt ------------------------------------------------------------------------
+
+crrt = 
+  dplyr::filter(data_list$crrt_therapy, hospitalization_id %in% cohort_hids) |>
+  dplyr::select(-ends_with("name")) |>
+  dplyr::collect() |>
+  join(hid_jid_crosswalk, how = "inner", multiple = T) |>
+  fselect(joined_hosp_id, recorded_dttm) |>
+  funique()
+
+crrt = 
+  join(crrt, date_frame, how = "inner", multiple = T) |>
+  fsubset(recorded_dttm >= admission_dttm) |>
+  fsubset(recorded_dttm <= discharge_dttm)
+
+crrt = 
+  roworder(crrt, recorded_dttm) |>
+  fgroup_by(joined_hosp_id) |>
+  fsummarize(event_dttm = ffirst(recorded_dttm)) |>
+  ftransform(event = "crrt")
+
+  ## medications -----------------------------------------------------------------
+
+## stress-dose corticosteroids -------------------------------------------------
+
+steroid = 
+  dplyr::filter(data_list$medication_admin_intermittent, hospitalization_id %in% cohort_hids) |>
+  dplyr::filter(tolower(med_group) == "steroid") |>
+  dplyr::select(-med_group) |>
+  dplyr::collect() |>
+  join(hid_jid_crosswalk, how = "inner", multiple = T) |>
+  fselect(joined_hosp_id, admin_dttm, med_category) |>
+  funique()
+
+steroid = 
+  join(steroid, date_frame, how = "inner", multiple = T) |>
+  fsubset(recorded_dttm >= admission_dttm) |>
+  fsubset(recorded_dttm <= discharge_dttm)
+
+
+
+## vasopressors ----------------------------------------------------------------
+
+va_list = c(
+  "norepinephrine",
+  "vasopressin",
+  "phenylephrine",
+  "epinephrine",
+  "dopamine",
+  "angiotensin_2",
+  "dobutamine",
+  "milrinone"
+)
+
+meds = 
+  dplyr::filter(data_list$medication_admin_continuous, tolower(med_category) %in% va_list) |>
+  dplyr::filter(hospitalization_id %in% cohort_hids) |>
+  dplyr::collect() |>
+  join(hid_jid_crosswalk, how = "inner", multiple = T) |>
+  fselect(
+    joined_hosp_id,
+    admin_dttm, 
+   # mar_action_category,
+    med_category, 
+    med_dose, 
+    med_dose_unit
+  ) |>
+  funique()
+
+meds = 
+  join(meds, date_frame, how = "inner", multiple = T) |>
+  fsubset(admin_dttm >= admission_dttm) |>
+  fsubset(admin_dttm <= discharge_dttm) |>
+  fmutate(
+    med_category = tolower(med_category),
+    event = case_when(
+      med_category == "dobutamine" ~ "inotrope",
+      med_category == "milrinone"  ~ "inotrope",
+      TRUE                         ~ "vasopressor"
+    )
+  )|>
+  select(joined_hosp_id, event_dttm = admin_dttm, event, med_category) |> # needs adjusting to include dosage
+  funique()
+
+rm(va_list); gc()
+
+
+
+### combine and save -----------------------------------------------------------
+
+## outcomes data frame ---------------------------------------------------------
+
+df_outcomes = rowbind(events, death, hospice, meds, resp, fill = T) 
+
+fwrite(df_outcomes, here("proj_tables", "outcome_times.csv"))
+
+rm(df_outcomes, death, hospice, events); gc()
+
+rowbind(meds, resp, fill = T) |> 
+  write_parquet(here("proj_tables", "careprocess.parquet"))
+
+## cohort (1 row per encounter) ------------------------------------------------
+
+cohort = 
+  funique(cohort) |>
+  select(
+    patient_id, 
+    joined_hosp_id, 
+    admission_dttm, 
+    discharge_dttm,
+    age, 
+    race_category, 
+    ethnicity_category, 
+    ends_with("01"),
+    initial_code_status,
+    los_hosp_d
+  ) |>
+  mutate(across(
+    .cols = ends_with("category"),
+    .fns  = ~if_else(is.na(.x), "unknown", tolower(.x))
+  )) |> 
+  mutate(across(
+    .cols = ends_with("01"),
+    .fns  = ~if_else(is.na(.x), 0L, .x)
+  ))
+
+## add elixhauser --------------------------------------------------------------
+
+### vector common codes to avoid for RAM's sake (to repl w/ keep list) ---------
+
+unused_vect = c(
+  "Z79.899",
+  "E78.5",
+  "Z87.891",
+  "K21.9",
+  "Z20.822",
+  "F17.210",
+  "Z79.01",
+  "N17.9"
+)
+
+### only relevant codes from relevant encounters -------------------------------
+
+elix = 
+  dplyr::filter(data_list$hospital_diagnosis, hospitalization_id %in% cohort_hids) |>
+  dplyr::filter(!toupper(diagnosis_code) %in% unused_vect) |>
+  dplyr::select(hospitalization_id, poa_present, diagnosis_code) |>
+  dplyr::collect() |>
+  funique()
+
+### assign elixhauser diagnosis dummies ----------------------------------------
+
+elix = 
+  comorbidity::comorbidity(
+    elix, 
+    id      = "hospitalization_id", 
+    code    = "diagnosis_code", 
+    map     = "elixhauser_icd10_quan", 
+    assign0 = T
+  )
+
+### link to joined-hosp-id -----------------------------------------------------
+
+elix = 
+  join(elix, hid_jid_crosswalk, how = "left", multiple = T) |>
+  fselect(-patient_id, -hospitalization_id) |>
+  fgroup_by(joined_hosp_id) |>
+  fmax()
+
+### calculate vw scores --------------------------------------------------------
+
+vw        = comorbidity::score(elix, weights = "vw", assign0 = T)
+elix      = cbind(elix, vw = vw) |> fselect(joined_hosp_id, vw)
+cohort    = join(cohort, elix, how = "left", multiple = F)
+cohort$vw = if_else(is.na(cohort$vw), 0L, cohort$vw)
+
+rm(elix, vw); gc()
+
+## add hospital_id -------------------------------------------------------------
+
+hospital = 
+  dplyr::select(data_list$adt, hospitalization_id, in_dttm, hospital_id) |>
+  dplyr::filter(hospitalization_id %in% cohort_hids) |>
+  dplyr::collect()
+
+hospital = 
+  join(hospital, hid_jid_crosswalk, how = "left", multiple = T) |>
+  roworder(in_dttm) |>
+  fgroup_by(joined_hosp_id) |>
+  fsummarize(hospital_id = ffirst(hospital_id))
+
+cohort = join(cohort, hospital, how = "left", multiple = F)
+
+rm(hospital); gc()
+
+## sanity check before saving --------------------------------------------------
+
+props = 
+  tidytable(
+    icu     = fmean(cohort$icu_01,     na.rm=TRUE),
+    dead    = fmean(cohort$dead_01,    na.rm=TRUE),
+    hospice = fmean(cohort$hospice_01, na.rm=TRUE),
+    imv     = fmean(cohort$imv_01,     na.rm=TRUE),
+    va      = fmean(cohort$va_01,      na.rm=TRUE)
+  )
+
+if (
+  props$icu     > 0.50 | props$icu == 0     |
+  props$dead    > 0.20 | props$dead == 0    |
+  props$hospice > 0.10 | props$hospice == 0 |
+  props$imv     > 0.40 | props$imv == 0     |
+  props$va      > 0.40 | props$va == 0) {
+  stop("Sanity check failed: Outcome distribution out of expected range.")
+}
+
+write_parquet(cohort,            here("proj_tables", "cohort.parquet"))
+write_parquet(hid_jid_crosswalk, here("proj_tables", "hid_jid_crosswalk.parquet"))
+
+# go to 02
