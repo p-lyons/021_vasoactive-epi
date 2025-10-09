@@ -269,14 +269,13 @@ cohort_jids = funique(cohort$joined_hosp_id)
 cohort_hids = funique(hid_jid_crosswalk$hospitalization_id)
 date_frame  = select(cohort, patient_id, joined_hosp_id, ends_with("dttm"))
 
+rm(hid_dups_source, pa_list, get_ram_gb, validate_table); gc()
+
 ## vasopressors ----------------------------------------------------------------
 
 ## vasoactives -----------------------------------------------------------------
 
-vlist = c(
-  "norepinephrine", 
-  "vasopressin"
-)
+vlist = c("norepinephrine", "vasopressin")
 
 va = 
   dplyr::filter(data_list$medication_admin_continuous, med_category %in% vlist) |>
@@ -288,7 +287,7 @@ va =
     strength, 
     med_dose,
     med_dose_unit,
-    mar_action_category
+    mar_action_name ## needs to be category
   ) |>
   dplyr::collect() |>
   funique()
@@ -298,15 +297,15 @@ va =
   join(date_frame,            how = "inner", multiple = T) |>
   fsubset(admin_dttm >= admission_dttm) |>
   fsubset(admin_dttm <= discharge_dttm) |>
-  fsubset() |> # make sure med is GOING
+  #fsubset() |> # make sure med is GOING
   ftransform(admin_dttm = lubridate::floor_date(admin_dttm, unit = "hours")) |>
-  ftransform() |> # update dose units if need be
-  fgroup_by(joined_hosp_id, admin_dttm, med_category) |>
+  #ftransform() |> # update dose units if need be
+  fgroup_by(joined_hosp_id, admin_dttm, med_category, med_dose_unit) |>
   fsummarize(med_dose = fmax(med_dose)) |>
   pivot_wider(names_from = med_category, values_from = med_dose)
 
-va = fsubset(va, !is.na(vasopressin))
 va = fsubset(va, norepinephrine >= 0.2)
+#va = fsubset(va, !is.na(vasopressin))
 
 cohort_jids       = funique(va$joined_hosp_id)
 cohort            = fsubset(cohort, joined_hosp_id %in% cohort_jids)
@@ -346,6 +345,12 @@ if (nrow(pt_dups) > 0) {
   )
 }
 
+cohort_demographics$language_category = case_when(
+  cohort_demographics$language_category == "spanish" ~ "spanish",
+  cohort_demographics$language_category == "english" ~ "english",
+  TRUE                                               ~ "other"
+)
+
 ### add demographics to cohort df ----------------------------------------------
 
 cohort = 
@@ -363,13 +368,17 @@ cohort =
 
 rm(pt_dups, cohort_demographics); gc()
 
-## admission code status -------------------------------------------------------
+## code status -----------------------------------------------------------------
+
+### get all codes from arrow table ---------------------------------------------
 
 codes = 
-  data_list[["code_status"]] |>
+  dplyr::filter(data_list[["code_status"]], patient_id %in% cohort_pats) |>
   dplyr::select(patient_id, start_dttm, code_status_category) |>
   dplyr::collect() |>
   funique()
+
+### set aside all codes for "events" table -------------------------------------
 
 codes = 
   join(cohort, codes, how = "left", multiple = T) |>
@@ -377,12 +386,14 @@ codes =
   fsubset(start_dttm <= discharge_dttm) |>
   roworder(start_dttm) 
 
-events = select(codes, patient_id, event_dttm = start_dttm, event = code_status_category)
+events = select(codes, joined_hosp_id, event_dttm = start_dttm, event = code_status_category)
+
+### identify initial code status -----------------------------------------------
 
 codes = 
   fgroup_by(codes, joined_hosp_id) |>
-  fsummarize(initial_code_status = ffirst(code_status_category)) |>
-  fmutate(initial_code_status = if_else(tolower(initial_code_status) == "dnr", "Special/Partial", initial_code_status))
+  fsummarize(first_code_status = ffirst(code_status_category)) |>
+  ftransform(first_code_status = if_else(tolower(first_code_status) == "dnr", "special/partial", tolower(first_code_status)))
 
 cohort = join(cohort, codes, how = "left", multiple = F)
 
@@ -404,6 +415,67 @@ hospice =
   select(joined_hosp_id, event_dttm = discharge_dttm) |>
   fmutate(event = "hospice") 
 
+## intubation ------------------------------------------------------------------
+
+resp = 
+  dplyr::filter(data_list$respiratory_support, hospitalization_id %in% cohort_hids) |>
+  dplyr::filter(tolower(device_category) == "imv") |>
+  dplyr::select(hospitalization_id, recorded_dttm) |>
+  dplyr::collect() |>
+  join(hid_jid_crosswalk, how = "inner", multiple = T) |>
+  fselect(joined_hosp_id, recorded_dttm) |>
+  funique()
+
+resp = 
+  join(resp, date_frame, how = "inner", multiple = T) |>
+  fsubset(recorded_dttm >= admission_dttm) |>
+  fsubset(recorded_dttm <= discharge_dttm) |>
+  roworder(recorded_dttm) |>
+  fgroup_by(joined_hosp_id) |>
+  fsummarize(event_dttm = ffirst(recorded_dttm)) |>
+  ftransform(event = "imv")
+
+## crrt ------------------------------------------------------------------------
+
+crrt = 
+  dplyr::filter(data_list$crrt_therapy, hospitalization_id %in% cohort_hids) |>
+  dplyr::select(-ends_with("name")) |>
+  dplyr::collect() |>
+  join(hid_jid_crosswalk, how = "inner", multiple = T) |>
+  fselect(joined_hosp_id, recorded_dttm) |>
+  funique()
+
+crrt = 
+  join(crrt, date_frame, how = "inner", multiple = T) |>
+  fsubset(recorded_dttm >= admission_dttm) |>
+  fsubset(recorded_dttm <= discharge_dttm)
+
+crrt = 
+  roworder(crrt, recorded_dttm) |>
+  fgroup_by(joined_hosp_id) |>
+  fsummarize(event_dttm = ffirst(recorded_dttm)) |>
+  ftransform(event = "crrt")
+
+  ## medications -----------------------------------------------------------------
+
+## stress-dose corticosteroids -------------------------------------------------
+
+steroid = 
+  dplyr::filter(data_list$medication_admin_intermittent, hospitalization_id %in% cohort_hids) |>
+  dplyr::filter(tolower(med_group) == "steroid") |>
+  dplyr::select(-med_group) |>
+  dplyr::collect() |>
+  join(hid_jid_crosswalk, how = "inner", multiple = T) |>
+  fselect(joined_hosp_id, admin_dttm, med_category) |>
+  funique()
+
+steroid = 
+  join(steroid, date_frame, how = "inner", multiple = T) |>
+  fsubset(recorded_dttm >= admission_dttm) |>
+  fsubset(recorded_dttm <= discharge_dttm)
+
+
+
 ## vasopressors ----------------------------------------------------------------
 
 va_list = c(
@@ -419,10 +491,17 @@ va_list = c(
 
 meds = 
   dplyr::filter(data_list$medication_admin_continuous, tolower(med_category) %in% va_list) |>
-  dplyr::select(hospitalization_id, admin_dttm, ends_with("category")) |>
+  dplyr::filter(hospitalization_id %in% cohort_hids) |>
   dplyr::collect() |>
   join(hid_jid_crosswalk, how = "inner", multiple = T) |>
-  fselect(joined_hosp_id, admin_dttm, med_category, med_dose, mar_action_category) |>
+  fselect(
+    joined_hosp_id,
+    admin_dttm, 
+   # mar_action_category,
+    med_category, 
+    med_dose, 
+    med_dose_unit
+  ) |>
   funique()
 
 meds = 
@@ -442,52 +521,13 @@ meds =
 
 rm(va_list); gc()
 
-### respiratory support --------------------------------------------------------
 
-resp_list = c(
-  "imv",
-  "nippv",
-  "high flow nc"
-)
-
-resp = 
-  dplyr::filter(data_list$respiratory_support, hospitalization_id %in% cohort_hids) |>
-  dplyr::filter(tolower(device_category) %in% resp_list) |>
-  dplyr::select(hospitalization_id, recorded_dttm, device_category) |>
-  dplyr::collect() |>
-  join(hid_jid_crosswalk, how = "inner", multiple = T) |>
-  fselect(joined_hosp_id, recorded_dttm, device_category) |>
-  funique()
-
-resp = 
-  join(resp, date_frame, how = "inner", multiple = T) |>
-  fsubset(recorded_dttm >= admission_dttm) |>
-  fsubset(recorded_dttm <= discharge_dttm) |>
-  fmutate(event = tolower(device_category)) |>
-  select(joined_hosp_id, event_dttm = recorded_dttm, event) |>
-  funique()
-
-present_events  = sort(funique(tolower(resp$event)))
-missing_events  = setdiff(resp_list, present_events)
-
-if (length(missing_events) > 0) {
-  stop(
-    sprintf("Resp need at least one %s, but %s not found.",
-            if (length(missing_events) == 1) "event" else "events",
-            paste(missing_events, collapse = ", ")
-    ),
-    call. = FALSE
-  )
-}
-
-rm(resp_list, present_events, missing_events)
-gc()
 
 ### combine and save -----------------------------------------------------------
 
 ## outcomes data frame ---------------------------------------------------------
 
-df_outcomes = rowbind(events, death, hospice, meds, resp) 
+df_outcomes = rowbind(events, death, hospice, meds, resp, fill = T) 
 
 fwrite(df_outcomes, here("proj_tables", "outcome_times.csv"))
 
@@ -500,16 +540,11 @@ rowbind(meds, resp, fill = T) |>
 
 cohort = 
   funique(cohort) |>
-  fmutate(wicu_01 = if_else(joined_hosp_id %in% ward_icu_tx, 1L, 0L, 0L)) |>
-  fmutate(icu_01  = if_else(joined_hosp_id %in% icu_encs,    1L, 0L, 0L)) |>
-  fmutate(imv_01  = if_else(joined_hosp_id %in% imv_encs,    1L, 0L, 0L)) |>
-  fmutate(va_01   = if_else(joined_hosp_id %in% va_encs,     1L, 0L, 0L)) |>
   select(
     patient_id, 
     joined_hosp_id, 
     admission_dttm, 
     discharge_dttm,
-    first_ward_dttm,
     age, 
     race_category, 
     ethnicity_category, 
