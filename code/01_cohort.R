@@ -275,20 +275,14 @@ rm(hid_dups_source, pa_list, get_ram_gb, validate_table); gc()
 
 ## vasoactives -----------------------------------------------------------------
 
+### all norepi and vasopressin adminiistrations --------------------------------
+
 vlist = c("norepinephrine", "vasopressin")
 
 va = 
   dplyr::filter(data_list$medication_admin_continuous, med_category %in% vlist) |>
-  dplyr::filter(hospitalization_id %in% cohort_hids) |>
-  dplyr::select(
-    hospitalization_id, 
-    admin_dttm, 
-    med_category, 
-    strength, 
-    med_dose,
-    med_dose_unit,
-    mar_action_name ## needs to be category
-  ) |>
+  #dplyr::filter(hospitalization_id %in% cohort_hids) |>
+  dplyr::select(-med_name, -med_route_name, -mar_action_name, -med_group) |>
   dplyr::collect() |>
   funique()
 
@@ -296,16 +290,91 @@ va =
   join(va, hid_jid_crosswalk, how = "inner", multiple = T) |>
   join(date_frame,            how = "inner", multiple = T) |>
   fsubset(admin_dttm >= admission_dttm) |>
-  fsubset(admin_dttm <= discharge_dttm) |>
-  #fsubset() |> # make sure med is GOING
-  ftransform(admin_dttm = lubridate::floor_date(admin_dttm, unit = "hours")) |>
-  #ftransform() |> # update dose units if need be
-  fgroup_by(joined_hosp_id, admin_dttm, med_category, med_dose_unit) |>
-  fsummarize(med_dose = fmax(med_dose)) |>
-  pivot_wider(names_from = med_category, values_from = med_dose)
+  fsubset(admin_dttm <= discharge_dttm) 
 
-va = fsubset(va, norepinephrine >= 0.2)
-#va = fsubset(va, !is.na(vasopressin))
+### correct non-weight-based doses ---------------------------------------------
+
+w = 
+  dplyr::filter(data_list$vitals, vital_category == "weight_kg") |>
+  dplyr::filter(hospitalization_id %in% cohort_hids) |>
+  dplyr::select(hospitalization_id, recorded_dttm, weight_kg = vital_value) |>
+  dplyr::collect() |>
+  funique()
+
+w = 
+  join(w, hid_jid_crosswalk, how = "inner", multiple = T) |>
+  join(date_frame,           how = "inner", multiple = T) |>
+  fsubset(recorded_dttm >= admission_dttm) |>
+  fsubset(recorded_dttm <= discharge_dttm) |>
+  roworder(recorded_dttm) |>
+  fgroup_by(joined_hosp_id) |>
+  fsummarize(weight_kg = ffirst(weight_kg))
+
+va = 
+  join(va, w, how = "left", multiple = T) |>
+  fmutate(
+    weight_kg     = if_else(is.na(weight_kg), 70, weight_kg),
+    med_dose      = case_when(
+      med_dose_unit == "mcg/min"      ~ med_dose/weight_kg,
+      med_dose_unit == "units/kg/min" ~ med_dose*weight_kg,
+      TRUE                            ~ med_dose
+    ),
+    med_dose_unit = case_when(
+      med_dose_unit == "mcg/min"      ~ "mcg/kg/min",
+      med_dose_unit == "units/kg/min" ~ "units/min",
+      TRUE                            ~ med_dose_unit
+    )
+  ) 
+
+### at least 0.2 norepi at some point and vaso at some point -------------------
+
+ne = 
+  fgroup_by(va, joined_hosp_id, med_category) |>
+  fsummarize(max_dose = fmax(med_dose)) |>
+  fsubset(med_category == "norepinephrine") |>
+  fsubset(max_dose >= 0.2) |>
+  pull(joined_hosp_id)
+
+vaso = 
+  fsubset(va, med_category == "vasopressin") |>
+  pull(joined_hosp_id)
+
+va = 
+  fsubset(va, joined_hosp_id %in% ne & joined_hosp_id %in% vaso) |>
+  fgroup_by(joined_hosp_id, admin_dttm, med_category, mar_action_category) |>
+  fsummarize(med_dose = fmax(med_dose)) |>
+  ftransform(med_dose = if_else(mar_action_category == "stopped", 0, med_dose))
+
+### separate ne and vaso for carryforward alignment ----------------------------
+
+ne         = fsubset(va, med_category == "norepinephrine") |> fselect(-med_category)
+vaso       = fsubset(va, med_category == "vasopressin")
+ne_times   = fselect(ne,   joined_hosp_id, admin_dttm) |> funique()
+vaso_times = fselect(vaso, joined_hosp_id, admin_dttm) |> funique()
+
+ne = 
+  join(ne, vaso_times, how = "full", multiple = T) |>
+  roworder(admin_dttm) |>
+  fill(everything(), .direction = "down", .by = joined_hosp_id) |>
+  fsubset(!is.na(med_dose)) |>
+  fselect(joined_hosp_id, admin_dttm, ne_dose = med_dose)
+
+vaso = 
+  join(vaso, ne_times, how = "full", multiple = T) |>
+  roworder(admin_dttm) |>
+  fill(everything(), .direction = "down", .by = joined_hosp_id) |>
+  fsubset(!is.na(med_dose)) |>
+  fselect(joined_hosp_id, admin_dttm, vp_dose = med_dose)
+
+va_time_zero = 
+  join(ne, vaso, how = "full", multiple = T) |>
+  fsubset(ne_dose >= 0.2) |>
+  fsubset(!is.na(vp_dose)) |>
+  roworder(admin_dttm) |>
+  fgroup_by(joined_hosp_id) |>
+  fsummarize(time_0 = ffirst(admin_dttm))
+
+cohort = join(cohort, va_time_zero, how = "inner", multiple = F)
 
 cohort_jids       = funique(va$joined_hosp_id)
 cohort            = fsubset(cohort, joined_hosp_id %in% cohort_jids)
@@ -314,14 +383,93 @@ cohort_hids       = funique(hid_jid_crosswalk$hospitalization_id)
 cohort_pats       = funique(cohort$patient_id)
 date_frame        = select(cohort, patient_id, joined_hosp_id, ends_with("dttm"))
 
-## time starts at the moment vasopressor requirements are met ------------------
+## full set of vasoactives for escalation evaluations --------------------------
 
-time_0 = 
-  roworder(va, admin_dttm) |>
-  fgroup_by(joined_hosp_id) |>
-  fsummarize(time_0 = ffirst(admin_dttm))
+big = c(
+  "epinephrine",
+  "phenylephrine",
+  "angiotensin"
+)
 
-cohort = join(cohort, time_0, how = "left", multiple = F)
+va = 
+  dplyr::filter(data_list$medication_admin_continuous, med_category %in% big) |>
+  #dplyr::filter(hospitalization_id %in% cohort_hids) |>
+  dplyr::select(-med_name, -med_route_name, -mar_action_name, -med_group) |>
+  dplyr::collect() |>
+  funique()
+
+va = 
+  join(va, hid_jid_crosswalk, how = "inner", multiple = T) |>
+  join(date_frame,            how = "inner", multiple = T) |>
+  fsubset(admin_dttm >= admission_dttm) |>
+  fsubset(admin_dttm <= discharge_dttm) 
+
+va = 
+  join(va, w, how = "left", multiple = T) |>
+  fmutate(
+    weight_kg     = if_else(is.na(weight_kg), 70, weight_kg),
+    med_dose      = case_when(
+      med_dose_unit == "mcg/min"      ~ med_dose/weight_kg,
+      TRUE                            ~ med_dose
+    ),
+    med_dose_unit = case_when(
+      med_dose_unit == "mcg/min"      ~ "mcg/kg/min",
+      TRUE                            ~ med_dose_unit
+    )
+  ) 
+
+va = 
+  join(va, va_time_zero, how = "inner", multiple = T) |>
+  fsubset(admin_dttm >= time_0 - lubridate::dhours(24)) |>
+  fgroup_by(joined_hosp_id, admin_dttm, med_category, mar_action_category) |>
+  fsummarize(med_dose = fmax(med_dose)) |>
+  ftransform(med_dose = if_else(mar_action_category == "stopped", 0, med_dose))
+
+ang2         = fsubset(va, med_category == "angiotensin")   |> fselect(-med_category)
+epi          = fsubset(va, med_category == "epinephrine")   |> fselect(-med_category)
+phenyl       = fsubset(va, med_category == "phenylephrine") |> fselect(-med_category)
+ang2_times   = fselect(ang2,   joined_hosp_id, admin_dttm)  |> funique()
+epi_times    = fselect(epi,    joined_hosp_id, admin_dttm)  |> funique()
+phenyl_times = fselect(phenyl, joined_hosp_id, admin_dttm)  |> funique()
+
+all_times = 
+  join(ne_times, vaso_times, how = "full", multiple = T) |>
+  join(epi_times,            how = "full", multiple = T) |>
+  join(phenyl_times,         how = "full", multiple = T) |>
+  join(ang2_times,           how = "full", multiple = T) 
+  
+ang2 = 
+  join(ang2, all_times, how = "full", multiple = T) |>
+  roworder(admin_dttm) |>
+  fill(everything(), .direction = "down", .by = joined_hosp_id) |>
+  fsubset(!is.na(med_dose)) |>
+  fselect(joined_hosp_id, admin_dttm, a2_dose = med_dose)
+
+epi = 
+  join(epi, all_times, how = "full", multiple = T) |>
+  roworder(admin_dttm) |>
+  fill(everything(), .direction = "down", .by = joined_hosp_id) |>
+  fsubset(!is.na(med_dose)) |>
+  fselect(joined_hosp_id, admin_dttm, epi_dose = med_dose)
+
+phenyl = 
+  join(phenyl, all_times, how = "full", multiple = T) |>
+  roworder(admin_dttm) |>
+  fill(everything(), .direction = "down", .by = joined_hosp_id) |>
+  fsubset(!is.na(med_dose)) |>
+  fselect(joined_hosp_id, admin_dttm, phenyl_dose = med_dose)
+
+va = 
+  join(ne, vaso, how = "full", multiple = T) |>
+  join(epi,      how = "full", multiple = T) |>
+  join(phenyl,   how = "full", multiple = T) |>
+  join(ang2,     how = "full", multiple = T) |>
+  roworder(admin_dttm) |>
+  fill(everything(), .direction = "down", .by = joined_hosp_id)
+
+write_parquet(va, here("proj_tables", "vasoactive_doses.parquet"))
+
+rm(va, ne, vaso, epi, phenyl, ang2, all_times, ne_times, vaso_times, epi_times, phenyl_times); gc()
 
 # prepare additional cohort details --------------------------------------------
 
@@ -367,199 +515,6 @@ cohort =
   fselect(-sex_category, -discharge_category)
 
 rm(pt_dups, cohort_demographics); gc()
-
-## code status -----------------------------------------------------------------
-
-### get all codes from arrow table ---------------------------------------------
-
-codes = 
-  dplyr::filter(data_list[["code_status"]], patient_id %in% cohort_pats) |>
-  dplyr::select(patient_id, start_dttm, code_status_category) |>
-  dplyr::collect() |>
-  funique()
-
-### set aside all codes for "events" table -------------------------------------
-
-codes = 
-  join(cohort, codes, how = "left", multiple = T) |>
-  fsubset(start_dttm >= admission_dttm - lubridate::ddays(1)) |>
-  fsubset(start_dttm <= discharge_dttm) |>
-  roworder(start_dttm) 
-
-events = select(codes, joined_hosp_id, event_dttm = start_dttm, event = code_status_category)
-
-### identify initial code status -----------------------------------------------
-
-codes = 
-  fgroup_by(codes, joined_hosp_id) |>
-  fsummarize(first_code_status = ffirst(code_status_category)) |>
-  ftransform(first_code_status = if_else(tolower(first_code_status) == "dnr", "special/partial", tolower(first_code_status)))
-
-cohort = join(cohort, codes, how = "left", multiple = F)
-
-rm(codes); gc()
-
-# outcomes ---------------------------------------------------------------------
-
-## death -----------------------------------------------------------------------
-
-death = 
-  fsubset(cohort, dead_01 == 1) |>
-  select(joined_hosp_id, event_dttm = discharge_dttm) |>
-  fmutate(event = "death") 
-
-## hospice ---------------------------------------------------------------------
-
-hospice = 
-  fsubset(cohort, hospice_01 == 1) |>
-  select(joined_hosp_id, event_dttm = discharge_dttm) |>
-  fmutate(event = "hospice") 
-
-## intubation ------------------------------------------------------------------
-
-resp = 
-  dplyr::filter(data_list$respiratory_support, hospitalization_id %in% cohort_hids) |>
-  dplyr::filter(tolower(device_category) == "imv") |>
-  dplyr::select(hospitalization_id, recorded_dttm) |>
-  dplyr::collect() |>
-  join(hid_jid_crosswalk, how = "inner", multiple = T) |>
-  fselect(joined_hosp_id, recorded_dttm) |>
-  funique()
-
-resp = 
-  join(resp, date_frame, how = "inner", multiple = T) |>
-  fsubset(recorded_dttm >= admission_dttm) |>
-  fsubset(recorded_dttm <= discharge_dttm) |>
-  roworder(recorded_dttm) |>
-  fgroup_by(joined_hosp_id) |>
-  fsummarize(event_dttm = ffirst(recorded_dttm)) |>
-  ftransform(event = "imv")
-
-## crrt ------------------------------------------------------------------------
-
-crrt = 
-  dplyr::filter(data_list$crrt_therapy, hospitalization_id %in% cohort_hids) |>
-  dplyr::select(-ends_with("name")) |>
-  dplyr::collect() |>
-  join(hid_jid_crosswalk, how = "inner", multiple = T) |>
-  fselect(joined_hosp_id, recorded_dttm) |>
-  funique()
-
-crrt = 
-  join(crrt, date_frame, how = "inner", multiple = T) |>
-  fsubset(recorded_dttm >= admission_dttm) |>
-  fsubset(recorded_dttm <= discharge_dttm)
-
-crrt = 
-  roworder(crrt, recorded_dttm) |>
-  fgroup_by(joined_hosp_id) |>
-  fsummarize(event_dttm = ffirst(recorded_dttm)) |>
-  ftransform(event = "crrt")
-
-  ## medications -----------------------------------------------------------------
-
-## stress-dose corticosteroids -------------------------------------------------
-
-steroid = 
-  dplyr::filter(data_list$medication_admin_intermittent, hospitalization_id %in% cohort_hids) |>
-  dplyr::filter(tolower(med_group) == "steroid") |>
-  dplyr::select(-med_group) |>
-  dplyr::collect() |>
-  join(hid_jid_crosswalk, how = "inner", multiple = T) |>
-  fselect(joined_hosp_id, admin_dttm, med_category) |>
-  funique()
-
-steroid = 
-  join(steroid, date_frame, how = "inner", multiple = T) |>
-  fsubset(recorded_dttm >= admission_dttm) |>
-  fsubset(recorded_dttm <= discharge_dttm)
-
-
-
-## vasopressors ----------------------------------------------------------------
-
-va_list = c(
-  "norepinephrine",
-  "vasopressin",
-  "phenylephrine",
-  "epinephrine",
-  "dopamine",
-  "angiotensin_2",
-  "dobutamine",
-  "milrinone"
-)
-
-meds = 
-  dplyr::filter(data_list$medication_admin_continuous, tolower(med_category) %in% va_list) |>
-  dplyr::filter(hospitalization_id %in% cohort_hids) |>
-  dplyr::collect() |>
-  join(hid_jid_crosswalk, how = "inner", multiple = T) |>
-  fselect(
-    joined_hosp_id,
-    admin_dttm, 
-   # mar_action_category,
-    med_category, 
-    med_dose, 
-    med_dose_unit
-  ) |>
-  funique()
-
-meds = 
-  join(meds, date_frame, how = "inner", multiple = T) |>
-  fsubset(admin_dttm >= admission_dttm) |>
-  fsubset(admin_dttm <= discharge_dttm) |>
-  fmutate(
-    med_category = tolower(med_category),
-    event = case_when(
-      med_category == "dobutamine" ~ "inotrope",
-      med_category == "milrinone"  ~ "inotrope",
-      TRUE                         ~ "vasopressor"
-    )
-  )|>
-  select(joined_hosp_id, event_dttm = admin_dttm, event, med_category) |> # needs adjusting to include dosage
-  funique()
-
-rm(va_list); gc()
-
-
-
-### combine and save -----------------------------------------------------------
-
-## outcomes data frame ---------------------------------------------------------
-
-df_outcomes = rowbind(events, death, hospice, meds, resp, fill = T) 
-
-fwrite(df_outcomes, here("proj_tables", "outcome_times.csv"))
-
-rm(df_outcomes, death, hospice, events); gc()
-
-rowbind(meds, resp, fill = T) |> 
-  write_parquet(here("proj_tables", "careprocess.parquet"))
-
-## cohort (1 row per encounter) ------------------------------------------------
-
-cohort = 
-  funique(cohort) |>
-  select(
-    patient_id, 
-    joined_hosp_id, 
-    admission_dttm, 
-    discharge_dttm,
-    age, 
-    race_category, 
-    ethnicity_category, 
-    ends_with("01"),
-    initial_code_status,
-    los_hosp_d
-  ) |>
-  mutate(across(
-    .cols = ends_with("category"),
-    .fns  = ~if_else(is.na(.x), "unknown", tolower(.x))
-  )) |> 
-  mutate(across(
-    .cols = ends_with("01"),
-    .fns  = ~if_else(is.na(.x), 0L, .x)
-  ))
 
 ## add elixhauser --------------------------------------------------------------
 
@@ -630,25 +585,179 @@ cohort = join(cohort, hospital, how = "left", multiple = F)
 
 rm(hospital); gc()
 
+## code status -----------------------------------------------------------------
+
+### get all codes from arrow table ---------------------------------------------
+
+codes = 
+  dplyr::filter(data_list[["code_status"]], patient_id %in% cohort_pats) |>
+  dplyr::select(patient_id, start_dttm, code_status_category) |>
+  dplyr::collect() |>
+  funique()
+
+### set aside all codes for "events" table -------------------------------------
+
+codes = 
+  join(cohort, codes, how = "left", multiple = T) |>
+  fsubset(start_dttm >= admission_dttm - lubridate::ddays(1)) |>
+  fsubset(start_dttm <= discharge_dttm) |>
+  roworder(start_dttm) 
+
+events = select(codes, joined_hosp_id, event_dttm = start_dttm, event = code_status_category)
+
+### identify initial code status -----------------------------------------------
+
+codes = 
+  fgroup_by(codes, joined_hosp_id) |>
+  fsummarize(first_code_status = ffirst(code_status_category)) |>
+  ftransform(first_code_status = if_else(tolower(first_code_status) == "dnr", "special/partial", tolower(first_code_status)))
+
+cohort = join(cohort, codes, how = "left", multiple = F)
+
+rm(codes); gc()
+
+# outcomes ---------------------------------------------------------------------
+
+## death -----------------------------------------------------------------------
+
+death = 
+  fsubset(cohort, dead_01 == 1) |>
+  select(joined_hosp_id, event_dttm = discharge_dttm) |>
+  fmutate(event = "death") 
+
+## hospice ---------------------------------------------------------------------
+
+hospice = 
+  fsubset(cohort, hospice_01 == 1) |>
+  select(joined_hosp_id, event_dttm = discharge_dttm) |>
+  fmutate(event = "hospice") 
+
+## intubation ------------------------------------------------------------------
+
+resp = 
+  dplyr::filter(data_list$respiratory_support, hospitalization_id %in% cohort_hids) |>
+  dplyr::filter(tolower(device_category) == "imv") |>
+  dplyr::select(hospitalization_id, recorded_dttm) |>
+  dplyr::collect() |>
+  join(hid_jid_crosswalk, how = "inner", multiple = T) |>
+  fselect(joined_hosp_id, recorded_dttm) |>
+  funique()
+
+resp = 
+  join(resp, date_frame, how = "inner", multiple = T) |>
+  fsubset(recorded_dttm >= admission_dttm) |>
+  fsubset(recorded_dttm <= discharge_dttm) |>
+  roworder(recorded_dttm) |>
+  fgroup_by(joined_hosp_id) |>
+  fsummarize(imv_dttm = ffirst(recorded_dttm)) 
+
+cohort = join(cohort, resp, how = "left", multiple = F)
+
+## crrt ------------------------------------------------------------------------
+
+crrt = 
+  dplyr::filter(data_list$crrt_therapy, hospitalization_id %in% cohort_hids) |>
+  dplyr::select(-ends_with("name")) |>
+  dplyr::collect() |>
+  join(hid_jid_crosswalk, how = "inner", multiple = T) |>
+  fselect(joined_hosp_id, recorded_dttm) |>
+  funique()
+
+crrt = 
+  join(crrt, date_frame, how = "inner", multiple = T) |>
+  fsubset(recorded_dttm >= admission_dttm) |>
+  fsubset(recorded_dttm <= discharge_dttm)
+
+crrt = 
+  roworder(crrt, recorded_dttm) |>
+  fgroup_by(joined_hosp_id) |>
+  fsummarize(crrt_dttm = ffirst(recorded_dttm))
+
+cohort = join(cohort, crrt, how = "left", multiple = F)
+
+## stress-dose corticosteroids -------------------------------------------------
+
+steroid = 
+  dplyr::filter(data_list$medication_admin_intermittent, hospitalization_id %in% cohort_hids) |>
+  dplyr::filter(tolower(med_group) == "steroid") |>
+  dplyr::select(-med_group) |>
+  dplyr::collect() |>
+  join(hid_jid_crosswalk, how = "inner", multiple = T) |>
+  fselect(joined_hosp_id, admin_dttm, med_category) |>
+  funique()
+
+steroid = 
+  join(steroid, date_frame, how = "inner", multiple = T) |>
+  fsubset(recorded_dttm >= admission_dttm) |>
+  fsubset(recorded_dttm <= discharge_dttm)
+
+
+
+
+
+### combine and save -----------------------------------------------------------
+
+## outcomes data frame ---------------------------------------------------------
+
+df_outcomes = rowbind(events, death, hospice, meds, resp, fill = T) 
+
+fwrite(df_outcomes, here("proj_tables", "outcome_times.csv"))
+
+rm(df_outcomes, death, hospice, events); gc()
+
+rowbind(meds, resp, fill = T) |> 
+  write_parquet(here("proj_tables", "careprocess.parquet"))
+
+## cohort (1 row per encounter) ------------------------------------------------
+
+cohort = 
+  funique(cohort) |>
+  select(
+    patient_id, 
+    joined_hosp_id, 
+    admission_dttm, 
+    discharge_dttm,
+    time_0,
+    age, 
+    female_01,
+    race_category, 
+    ethnicity_category, 
+    language_category,
+    vw,
+    first_code_status,
+    los_hosp_d,
+    dead_01,
+    hospice_01,
+    imv_dttm,
+    crrt_dttm
+  ) |>
+  mutate(across(
+    .cols = ends_with("category"),
+    .fns  = ~if_else(is.na(.x), "unknown", tolower(.x))
+  )) |> 
+  mutate(across(
+    .cols = ends_with("01"),
+    .fns  = ~if_else(is.na(.x), 0L, .x)
+  ))
+
 ## sanity check before saving --------------------------------------------------
 
-props = 
-  tidytable(
-    icu     = fmean(cohort$icu_01,     na.rm=TRUE),
-    dead    = fmean(cohort$dead_01,    na.rm=TRUE),
-    hospice = fmean(cohort$hospice_01, na.rm=TRUE),
-    imv     = fmean(cohort$imv_01,     na.rm=TRUE),
-    va      = fmean(cohort$va_01,      na.rm=TRUE)
-  )
-
-if (
-  props$icu     > 0.50 | props$icu == 0     |
-  props$dead    > 0.20 | props$dead == 0    |
-  props$hospice > 0.10 | props$hospice == 0 |
-  props$imv     > 0.40 | props$imv == 0     |
-  props$va      > 0.40 | props$va == 0) {
-  stop("Sanity check failed: Outcome distribution out of expected range.")
-}
+# props = 
+#   tidytable(
+#     dead    = fmean(cohort$dead_01,    na.rm=TRUE),
+#     hospice = fmean(cohort$hospice_01, na.rm=TRUE),
+#     imv     = fmean(cohort$imv_01,     na.rm=TRUE),
+#     va      = fmean(cohort$va_01,      na.rm=TRUE)
+#   )
+# 
+# if (
+#   props$icu     > 0.50 | props$icu == 0     |
+#   props$dead    > 0.20 | props$dead == 0    |
+#   props$hospice > 0.10 | props$hospice == 0 |
+#   props$imv     > 0.40 | props$imv == 0     |
+#   props$va      > 0.40 | props$va == 0) {
+#   stop("Sanity check failed: Outcome distribution out of expected range.")
+# }
 
 write_parquet(cohort,            here("proj_tables", "cohort.parquet"))
 write_parquet(hid_jid_crosswalk, here("proj_tables", "hid_jid_crosswalk.parquet"))
