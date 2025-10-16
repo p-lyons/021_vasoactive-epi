@@ -187,10 +187,12 @@ required_tables =
     "adt", 
     "vitals", 
     "labs", 
+    "medication_admin_intermittent", 
     "medication_admin_continuous", 
     "respiratory_support",
     "code_status",
-    "patient_assessments"
+    "patient_assessments",
+    "crrt_therapy"
   )
 
 ## check required tables against available tables ------------------------------
@@ -471,8 +473,8 @@ pa_list = list(
 )
 
 crrt_list = list(
-  table_name = "crrt_therapty",
-  req_vars   = c("crrt_mode_category", "recorded_dttm"),
+  table_name = "crrt_therapy",
+  req_vars   = c("crrt_mode_category", "recorded_dttm")
 )
 
 validation_specs = list(
