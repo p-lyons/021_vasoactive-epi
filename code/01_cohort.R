@@ -160,7 +160,7 @@ gc()
 #### pull additional data for cohort filtering and final variables
 cohort_data = 
   dplyr::filter(data_list$hospitalization, hospitalization_id %in% cohort_hids) |>
-  dplyr::select(ends_with("id"), age_at_admission, discharge_category) |> 
+  dplyr::select(ends_with("id"), age_at_admission, discharge_category, census_block_code) |> 
   dplyr::collect()
 
 hid_dups_source =
@@ -184,6 +184,7 @@ cohort =
     age                = ffirst(age_at_admission),
     admission_dttm     = ffirst(admission_dttm),
     discharge_dttm     = flast(discharge_dttm),
+    census_block_code  = ffirst(census_block_code),
     discharge_category = flast(discharge_category)
   )
 
@@ -568,7 +569,7 @@ cohort$vw = if_else(is.na(cohort$vw), 0L, cohort$vw)
 
 rm(elix, vw); gc()
 
-## add hospital_id -------------------------------------------------------------
+## add hospital_id and type ----------------------------------------------------
 
 hospital = 
   dplyr::select(data_list$adt, hospitalization_id, in_dttm, hospital_id) |>
@@ -581,10 +582,27 @@ hospital =
   fgroup_by(joined_hosp_id) |>
   fsummarize(hospital_id = ffirst(hospital_id))
 
+adt = 
+  dplyr::filter(data_list$adt, hospitalization_id %in% cohort_hids) |>
+  dplyr::select(hospitalization_id, hospital_type, in_dttm, location_category) |>
+  dplyr::collect()
+
+adt = 
+  join(adt, hid_jid_crosswalk, how = "inner", multiple = T) |>
+  fselect(joined_hosp_id, hospital_type, in_dttm, location_category) |>
+  fsubset(location_category == "procedural") |>
+  roworder(in_dttm) |>
+  fgroup_by(joined_hosp_id) |>
+  fsummarize(
+    hospital_type  = ffirst(hospital_type),
+    procedure_dttm = ffirst(in_dttm)
+  )
+
 cohort = join(cohort, hospital, how = "left", multiple = F)
+cohort = join(cohort, adt,      how = "left", multiple = F)
 
-rm(hospital); gc()
-
+rm(hospital, adt); gc()
+  
 ## code status -----------------------------------------------------------------
 
 ### get all codes from arrow table ---------------------------------------------
@@ -691,10 +709,6 @@ steroid =
   fsubset(recorded_dttm >= admission_dttm) |>
   fsubset(recorded_dttm <= discharge_dttm)
 
-
-
-
-
 ### combine and save -----------------------------------------------------------
 
 ## outcomes data frame ---------------------------------------------------------
@@ -724,6 +738,7 @@ cohort =
     ethnicity_category, 
     language_category,
     vw,
+    census_block_code,
     first_code_status,
     los_hosp_d,
     dead_01,
@@ -763,3 +778,4 @@ write_parquet(cohort,            here("proj_tables", "cohort.parquet"))
 write_parquet(hid_jid_crosswalk, here("proj_tables", "hid_jid_crosswalk.parquet"))
 
 # go to 02
+
