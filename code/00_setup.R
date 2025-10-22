@@ -420,7 +420,7 @@ hosp_list = list(
 
 adt_list = list(
   table_name = "adt",
-  req_vars   = c("hospitalization_id", "hospital_id", "location_category", "in_dttm", "out_dttm"),
+  req_vars   = c("hospitalization_id", "hospital_id", "hospital_type", "location_category", "in_dttm", "out_dttm"),
   req_values = list(location_category = c("ed", "icu", "ward"))
 )
 
@@ -483,7 +483,7 @@ validation_specs = list(
   adt_list, 
   dx_list,
   med_list, 
-  imed_list,
+  #imed_list,
   resp_list, 
   vitals_list, 
   labs_list,
