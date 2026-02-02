@@ -91,7 +91,7 @@ Sys.setenv(ARROW_NUM_THREADS     = n_threads)
 options(mc.cores                 = n_threads)
 
 message(
-  
+
   sprintf(
     "Environment OK | OS=%s | Cores=%d | Threads=%d | RAM≈%s GB",
     os_type, all_cores, n_threads,
@@ -147,6 +147,16 @@ start_date = as.POSIXct("2016-01-01", tz = "UTC")
 end_date   = as.POSIXct("2024-12-31", tz = "UTC")
 today      = format(Sys.Date(), "%y%m%d")
 
+## required vital signs for cohort inclusion -----------------------------------
+
+req_vitals = c(
+  "heart_rate",
+  "sbp",
+  "dbp",
+  "resp_rate",
+  "spo2"
+)
+
 # data loading -----------------------------------------------------------------
 
 ## required tables for this project --------------------------------------------
@@ -159,7 +169,8 @@ required_tables = c(
   "vitals",
   "labs",
   "medication_admin_continuous",
-  "respiratory_support"
+  "respiratory_support",
+  "crrt_therapy"
 )
 
 ## check available tables ------------------------------------------------------
