@@ -20,6 +20,15 @@ message(sprintf("  Cohort size: %d encounters", nrow(cohort)))
 
 cohort_dt = as.data.table(cohort)
 
+# ensure categorical variables are character (Arrow may load as dictionary/factor)
+cat_cols = c("race_category", "ethnicity_category", "code_status_t0", 
+             "age_cat", "vw_cat", "los_cat", "icu_los_cat", "outcome_group")
+for (col in cat_cols) {
+  if (col %in% names(cohort_dt)) {
+    cohort_dt[, (col) := as.character(get(col))]
+  }
+}
+
 # ==============================================================================
 # CONTINUOUS VARIABLES - poolable stats
 # ==============================================================================
@@ -132,10 +141,6 @@ cat_vars = c(
 
 # function: cell counts for categorical variable
 summarize_categorical = function(df, var, group_var = "outcome_group") {
-  # ensure variable is character (not factor with integer storage)
-  df = copy(df)
-  df[, (var) := as.character(get(var))]
-  
   result = df[!is.na(get(group_var)) & get(group_var) != "other", .N, by = c(group_var, var)]
   result[, variable := var]
   setnames(result, var, "category")
