@@ -45,6 +45,39 @@ cont_pooled[is.infinite(min), min := NA_real_]
 cont_pooled[is.infinite(max), max := NA_real_]
 cont_pooled[is.nan(mean),     formatted := "—"]
 
+## p-values for continuous variables (Welch's ANOVA approximation) -------------
+
+calculate_welch_anova_p = function(means, sds, ns) {
+  # Welch's ANOVA for unequal variances
+  # Returns p-value for test of equal means across groups
+  k = length(means)
+  if (k < 2 || any(ns < 2) || any(is.na(sds)) || any(sds == 0)) return(NA_real_)
+  
+  weights = ns / (sds^2)
+  grand_mean = sum(weights * means) / sum(weights)
+  
+  # F statistic numerator
+  f_num = sum(weights * (means - grand_mean)^2) / (k - 1)
+  
+  # F statistic denominator (with Welch correction)
+  lambda = sum((1 - weights/sum(weights))^2 / (ns - 1))
+  f_den = 1 + (2 * (k - 2) / (k^2 - 1)) * lambda
+  
+  f_stat = f_num / f_den
+  
+  # Degrees of freedom
+  
+  df1 = k - 1
+  df2 = (k^2 - 1) / (3 * lambda)
+  
+  p_val = pf(f_stat, df1, df2, lower.tail = FALSE)
+  return(p_val)
+}
+
+cont_pvalues = cont_pooled[, .(
+  p_value = calculate_welch_anova_p(mean, sd, n)
+), by = variable]
+
 message("  Pooled ", uniqueN(cont_pooled$variable), " continuous variables")
 
 # ==============================================================================
@@ -66,6 +99,27 @@ binary_pooled[, formatted := paste0(format_n(n_1), " (", round(pct, 1), "%)")]
 
 # handle NA from masking
 binary_pooled[is.na(n_1), formatted := "<5"]
+
+## p-values for binary variables (chi-square test) -----------------------------
+
+calculate_chisq_p_binary = function(n_1_vec, n_vec) {
+  # Chi-square test for binary variable across groups
+  n_0_vec = n_vec - n_1_vec
+  if (any(is.na(n_1_vec)) || any(n_vec < 1)) return(NA_real_)
+  
+  obs = matrix(c(n_1_vec, n_0_vec), nrow = 2, byrow = TRUE)
+  
+  # Check for valid contingency table
+  if (any(colSums(obs) == 0) || any(rowSums(obs) == 0)) return(NA_real_)
+  
+  tryCatch({
+    chisq.test(obs)$p.value
+  }, error = function(e) NA_real_)
+}
+
+binary_pvalues = binary_pooled[, .(
+  p_value = calculate_chisq_p_binary(n_1, n)
+), by = variable]
 
 message("  Pooled ", uniqueN(binary_pooled$variable), " binary variables")
 
@@ -93,6 +147,29 @@ cat_pooled[, formatted := paste0(format_n(n), " (", round(pct, 1), "%)")]
 
 # handle masked cells
 cat_pooled[is.na(n), formatted := "<5"]
+
+## p-values for categorical variables (chi-square test) ------------------------
+
+calculate_chisq_p_cat = function(dt) {
+  # Chi-square test for categorical variable across outcome groups
+  # dt should have columns: outcome_group, category, n
+  wide = dcast(dt, category ~ outcome_group, value.var = "n", fill = 0)
+  
+  # Remove category column to get matrix
+  mat = as.matrix(wide[, -1, with = FALSE])
+  
+  # Check for valid contingency table
+  if (nrow(mat) < 2 || ncol(mat) < 2) return(NA_real_)
+  if (any(colSums(mat) == 0) || any(rowSums(mat) == 0)) return(NA_real_)
+  
+  tryCatch({
+    chisq.test(mat)$p.value
+  }, error = function(e) NA_real_)
+}
+
+cat_pvalues = cat_pooled[, .(
+  p_value = calculate_chisq_p_cat(.SD)
+), by = variable, .SDcols = c("outcome_group", "category", "n")]
 
 message("  Pooled ", uniqueN(cat_pooled$variable), " categorical variables")
 
@@ -232,6 +309,9 @@ cont_wide = dcast(
 )
 cont_wide[, category := NA_character_]
 
+# Add p-values for continuous variables
+cont_wide = merge(cont_wide, cont_pvalues, by = "variable", all.x = TRUE)
+
 ## binary variables wide -------------------------------------------------------
 
 # Filter to only variables we want
@@ -247,6 +327,9 @@ binary_wide = dcast(
   value.var = "formatted"
 )
 binary_wide[, category := NA_character_]
+
+# Add p-values for binary variables
+binary_wide = merge(binary_wide, binary_pvalues, by = "variable", all.x = TRUE)
 
 ## categorical variables wide --------------------------------------------------
 
@@ -289,6 +372,10 @@ cat_wide = dcast(
   value.var = "formatted"
 )
 
+# Add p-values for categorical variables (only on header row, NA for category rows)
+cat_wide = merge(cat_wide, cat_pvalues, by = "variable", all.x = TRUE)
+cat_wide[!is.na(category), p_value := NA_real_]
+
 ## combine all -----------------------------------------------------------------
 
 all_data = rbindlist(list(
@@ -301,6 +388,17 @@ all_data = rbindlist(list(
 ## merge labels ----------------------------------------------------------------
 
 all_data = merge(all_data, var_labels, by = "variable", all.x = TRUE)
+
+## format p-values -------------------------------------------------------------
+
+format_pvalue = function(p) {
+  ifelse(is.na(p), "", 
+         ifelse(p < 0.001, "<0.001",
+                ifelse(p < 0.01, sprintf("%.3f", p),
+                       sprintf("%.2f", p))))
+}
+
+all_data[, p_formatted := format_pvalue(p_value)]
 
 ## create display column -------------------------------------------------------
 
@@ -321,6 +419,10 @@ header_rows = data.table(
   category = NA_character_
 )
 header_rows = merge(header_rows, var_labels, by = "variable")
+
+# Add p-values to header rows for categorical variables
+header_rows = merge(header_rows, cat_pvalues, by = "variable", all.x = TRUE)
+header_rows[, p_formatted := format_pvalue(p_value)]
 
 # Check which headers are missing
 existing_headers = all_data[variable %in% categorical_vars & is.na(category)]
@@ -347,25 +449,28 @@ outcome_cols = intersect(names(OUTCOME_LABELS), names(all_data))
 
 # Characteristics table (sort_order < 100)
 char_data = all_data[sort_order < 100]
-table1_char = char_data[, c("display", outcome_cols), with = FALSE]
+table1_char = char_data[, c("display", outcome_cols, "p_formatted"), with = FALSE]
 setnames(table1_char, outcome_cols, OUTCOME_LABELS[outcome_cols])
 setnames(table1_char, "display", "Characteristic")
+setnames(table1_char, "p_formatted", "P-value")
 table1_char = table1_char[!is.na(Characteristic)]
 
 # Outcomes table (sort_order >= 100)
 outcome_data = all_data[sort_order >= 100]
-table1_outcomes = outcome_data[, c("display", outcome_cols), with = FALSE]
+table1_outcomes = outcome_data[, c("display", outcome_cols, "p_formatted"), with = FALSE]
 setnames(table1_outcomes, outcome_cols, OUTCOME_LABELS[outcome_cols])
 setnames(table1_outcomes, "display", "Outcome")
+setnames(table1_outcomes, "p_formatted", "P-value")
 table1_outcomes = table1_outcomes[!is.na(Outcome)]
 
 message("  Characteristics table: ", nrow(table1_char), " rows")
 message("  Outcomes table: ", nrow(table1_outcomes), " rows")
 
 # Combined for full table export
-table1 = all_data[, c("display", "section", outcome_cols), with = FALSE]
+table1 = all_data[, c("display", "section", outcome_cols, "p_formatted"), with = FALSE]
 setnames(table1, outcome_cols, OUTCOME_LABELS[outcome_cols])
 setnames(table1, "display", "Variable")
+setnames(table1, "p_formatted", "P-value")
 table1 = table1[!is.na(Variable)]
 
 message("  Combined Table 1: ", nrow(table1), " rows")
