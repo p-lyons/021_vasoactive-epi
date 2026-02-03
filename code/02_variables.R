@@ -292,7 +292,8 @@ cohort = ftransform(cohort,
 )
 
 cohort = ftransform(cohort,
-                    crrt_01 = fifelse(crrt_timing_group %in% c(1L, 2L), 1L, 0L)
+                    crrt_01       = fifelse(crrt_timing_group %in% c(1L, 2L), 1L, 0L),
+                    crrt_at_t0_01 = fifelse(crrt_timing_group == 1L, 1L, 0L)
 )
 
 # ==============================================================================
@@ -461,6 +462,12 @@ cohort = ftransform(cohort,
                     los_to_t0_d = as.numeric(difftime(t0_dttm, admission_dttm, units = "hours")) / 24
 )
 
+## LOS from T0 to discharge ----------------------------------------------------
+
+cohort = ftransform(cohort,
+                    los_from_t0_d = as.numeric(difftime(discharge_dttm, t0_dttm, units = "hours")) / 24
+)
+
 ## ICU LOS to T0 (in days for table) -------------------------------------------
 
 cohort = ftransform(cohort,
@@ -511,7 +518,9 @@ message("  Finalizing outcome groups...")
 
 ## death/hospice flag ----------------------------------------------------------
 
-cohort = ftransform(cohort, dead_hospice_01 = fifelse(dead_01 == 1 | hospice_01 == 1, 1L, 0L))
+cohort = ftransform(cohort,
+                    dead_hospice_01 = fifelse(dead_01 == 1 | hospice_01 == 1, 1L, 0L)
+)
 
 cohort$dead_hospice_01 = fifelse(is.na(cohort$dead_hospice_01), 0L, cohort$dead_hospice_01)
 cohort$escalated_01    = fifelse(is.na(cohort$escalated_01), 0L, cohort$escalated_01)
@@ -522,14 +531,13 @@ cohort$escalated_01    = fifelse(is.na(cohort$escalated_01), 0L, cohort$escalate
 # Group 2: Escalated + alive
 # Group 3: No escalation + alive
 
-cohort = ftransform(
-  cohort,
-  outcome_group = case_when(
-    dead_hospice_01 == 1                     ~ "dead_hospice",
-    escalated_01 == 1 & dead_hospice_01 == 0 ~ "escalated",
-    escalated_01 == 0 & dead_hospice_01 == 0 ~ "stable",
-    TRUE                                     ~ "other"
-  )
+cohort = ftransform(cohort,
+                    outcome_group = case_when(
+                      dead_hospice_01 == 1                     ~ "dead_hospice",
+                      escalated_01 == 1 & dead_hospice_01 == 0 ~ "escalated",
+                      escalated_01 == 0 & dead_hospice_01 == 0 ~ "stable",
+                      TRUE                                     ~ "other"
+                    )
 )
 
 cohort = ftransform(cohort,
