@@ -55,13 +55,36 @@ message(
           ifelse(is.finite(avail_ram_gb), round(avail_ram_gb, 1), "NA"))
 )
 
-# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+# initialize exclusion tracking ------------------------------------------------
 
-# cohort identification --------------------------------------------------------
+exclusions = data.table(
+  step         = character(),
+  n_remaining  = integer(),
+  n_excluded   = integer(),
+  reason       = character()
+)
 
-## start by linking contiguous hospitalizations --------------------------------
+add_exclusion = function(step_name, n_before, n_after, reason = NA_character_) {
+  exclusions <<- rbindlist(list(
+    exclusions,
+    data.table(
+      step        = step_name,
+      n_remaining = n_after,
+      n_excluded  = n_before - n_after,
+      reason      = reason
+    )
+  ))
+  message(sprintf("  [%s] %d → %d (-%d)", 
+                  step_name, n_before, n_after, n_before - n_after))
+}
 
-### encounters with age >= 18 and dates within study window --------------------
+# ==============================================================================
+# STEP 1: Link contiguous hospitalizations
+# ==============================================================================
+
+message("\n== Building cohort ==")
+
+## encounters with age >= 18 and dates within study window ---------------------
 
 hosp_blocks = 
   dplyr::filter(data_list$hospitalization, age_at_admission >= 18) |>
@@ -71,32 +94,38 @@ hosp_blocks =
   dplyr::collect() |>
   roworder(patient_id, admission_dttm)
 
-### use data.table to find joined hospitalizations with <= 6h gaps -------------
+## use data.table to find joined hospitalizations with <= 6h gaps --------------
 
 link_hours = 6L
 linked     = as.data.table(hosp_blocks)
 setorder(linked, patient_id, admission_dttm)
 
-#### calculate gaps between encounters
+# calculate gaps between encounters
 linked[, next_admit := shift(admission_dttm, type = "lead"), by = patient_id]
 linked[, next_gap   := as.numeric(difftime(next_admit, discharge_dttm, units = "hours"))]
 linked[, prev_dc    := shift(discharge_dttm, type = "lag"), by = patient_id]  
 linked[, prev_gap   := as.numeric(difftime(admission_dttm, prev_dc, units = "hours"))]
 
-#### mark encounters that should be linked
+# mark encounters that should be linked
 linked[, link_flag := (next_gap < link_hours | prev_gap < link_hours)]
 linked[is.na(link_flag), link_flag := FALSE]
 
-#### create unique joined hospitalization ID, new group whenever gap > link_hours from  previous discharge
+# create unique joined hospitalization ID
 linked[, new_group := is.na(prev_gap) | prev_gap >= link_hours]
 linked[, joined_hosp_id := .GRP, by = .(patient_id, cumsum(new_group))]
 
-#### create hid_jid_crosswalk --------------------------------------------------
+# create hid_jid_crosswalk
 hid_jid_crosswalk = select(linked, ends_with("id")) |> as_tidytable()
 
-## hospital ward admissions ----------------------------------------------------
+# EXCLUSION STEP 1: Starting cohort
+n_start = uniqueN(linked$joined_hosp_id)
+add_exclusion("01_adult_inpatients_study_period", n_start, n_start, "Starting cohort")
 
-### stay requires ed or icu ----------------------------------------------------
+# ==============================================================================
+# STEP 2: Require ED or ICU stay, exclude psych/rehab
+# ==============================================================================
+
+## stay requires ED or ICU -----------------------------------------------------
 
 inpatient_hids = 
   dplyr::filter(data_list$adt, tolower(location_category) %in% c("ed", "icu")) |>
@@ -111,7 +140,7 @@ inpatient_jids =
   distinct() |>
   tibble::deframe()
 
-### don't want to include psych ------------------------------------------------
+## exclude psych/rehab ---------------------------------------------------------
 
 drop_ob = 
   dplyr::filter(data_list$adt, tolower(location_category) %in% c("psych", "rehab")) |>
@@ -126,17 +155,31 @@ drop_ob_jids =
   distinct() |>
   tibble::deframe()
 
-linked = fsubset(linked,  joined_hosp_id %in% inpatient_jids) 
+## apply filters ---------------------------------------------------------------
+
+linked = fsubset(linked, joined_hosp_id %in% inpatient_jids) 
+
+# EXCLUSION STEP 2: Required ED or ICU
+n_after_ed_icu = uniqueN(linked$joined_hosp_id)
+add_exclusion("02_required_ed_or_icu", n_start, n_after_ed_icu, "No ED or ICU stay")
+
 linked = fsubset(linked, !joined_hosp_id %in% drop_ob_jids)
 linked = select(linked, ends_with("id"), ends_with("dttm"))
+
+# EXCLUSION STEP 3: Excluded psych/rehab
+n_after_psych = uniqueN(linked$joined_hosp_id)
+add_exclusion("03_excluded_psych_rehab", n_after_ed_icu, n_after_psych, "Psych or rehab stay")
 
 hid_jid_crosswalk = select(linked, ends_with("id"))
 cohort_hids       = funique(hid_jid_crosswalk$hospitalization_id)
 cohort_pats       = funique(hid_jid_crosswalk$patient_id)
 
-## assemble cohort data frame --------------------------------------------------
+# ==============================================================================
+# STEP 3: Assemble cohort data frame
+# ==============================================================================
 
-#### pull additional data for cohort filtering and final variables
+## pull additional data for cohort filtering and final variables ---------------
+
 cohort_data = 
   dplyr::filter(data_list$hospitalization, hospitalization_id %in% cohort_hids) |>
   dplyr::select(
@@ -160,7 +203,8 @@ if (nrow(hid_dups_source) > 0) {
   )
 }
 
-#### create final cohort - 1 row per joined_hosp_id
+## create final cohort - 1 row per joined_hosp_id ------------------------------
+
 cohort = 
   join(linked, cohort_data, how = "left", multiple = T) |>
   roworder(admission_dttm) |>
@@ -174,12 +218,13 @@ cohort =
     discharge_category      = flast(discharge_category)
   )
 
-#### clean up temporary variables
 rm(linked, cohort_data, inpatient_hids, inpatient_jids, drop_ob, drop_ob_jids); gc()
 
-## quality control -------------------------------------------------------------
+# ==============================================================================
+# STEP 4: Quality control - duplicates and deaths
+# ==============================================================================
 
-### check for duplicates -------------------------------------------------------
+## check for duplicates --------------------------------------------------------
 
 dupes = cohort |> janitor::get_dupes(patient_id, admission_dttm)
 
@@ -193,9 +238,9 @@ if (nrow(dupes) > 0) {
 
 message("✅ No duplicate joined_hosp_id found.")
 
-### YODO (you only die once) ---------------------------------------------------
+## YODO (you only die once) ----------------------------------------------------
 
-#### death duplicates ----------------------------------------------------------
+### death duplicates -----------------------------------------------------------
 
 dup_deaths = 
   fsubset(cohort, discharge_category == "Expired") |>
@@ -223,7 +268,7 @@ if (nrow(dup_deaths) > 0) {
   )
 }
 
-#### readmissions following death ----------------------------------------------
+### readmissions following death -----------------------------------------------
 
 death_times = 
   fsubset(cohort, tolower(discharge_category) == "expired") |>
@@ -249,17 +294,23 @@ if (nrow(post_death_admissions) > 0) {
 message("✅ Cleaned duplicate deaths and post-death encounters.")
 
 rm(dupes, dup_deaths, death_times, post_death_admissions, start_date, end_date)
-rm(encdrop, file_type, n_dupes, n_pats); gc()
+rm(hid_dups_source, get_ram_gb, validate_table); gc()
+
+# handle objects that may not exist
+if (exists("encdrop")) rm(encdrop)
+if (exists("file_type")) rm(file_type)
+if (exists("n_dupes")) rm(n_dupes)
+if (exists("n_pats")) rm(n_pats)
+gc()
 
 cohort_pats = funique(cohort$patient_id)
 cohort_jids = funique(cohort$joined_hosp_id)
 cohort_hids = funique(hid_jid_crosswalk$hospitalization_id)
 date_frame  = select(cohort, patient_id, joined_hosp_id, ends_with("dttm"))
 
-rm(hid_dups_source, get_ram_gb, validate_table); gc()
-
-## vasopressors ----------------------------------------------------------------
-
+# ==============================================================================
+# STEP 5: Identify T0 (NE >= 0.2 + vasopressin)
+# ==============================================================================
 
 message("\n== Identifying T0: NE >= 0.2 + vasopressin ==")
 
@@ -391,7 +442,11 @@ if (nrow(va_time_zero) == 0) {
 
 ## join T0 to cohort and filter ------------------------------------------------
 
+n_before_t0 = nrow(cohort)
 cohort = join(cohort, va_time_zero, how = "inner", multiple = FALSE)
+
+# EXCLUSION STEP 4: Met T0 criteria
+add_exclusion("04_met_t0_criteria", n_after_psych, nrow(cohort), "No concurrent NE>=0.2 + VP")
 
 cohort_jids       = funique(cohort$joined_hosp_id)
 hid_jid_crosswalk = fsubset(hid_jid_crosswalk, joined_hosp_id %in% cohort_jids)
@@ -402,7 +457,7 @@ date_frame        = select(cohort, patient_id, joined_hosp_id, ends_with("dttm")
 message(sprintf("  Final cohort: %d encounters", nrow(cohort)))
 
 # ==============================================================================
-# STEP 3: Build vasoactive doses table for escalation analysis
+# STEP 6: Build vasoactive doses table for escalation analysis
 # ==============================================================================
 
 message("\n== Building vasoactive doses table ==")
@@ -511,7 +566,7 @@ rm(ne_times, vaso_times, epi_times, phenyl_times, dopa_times, ang2_times, all_ti
 gc()
 
 # ==============================================================================
-# STEP 4: Add patient demographics
+# STEP 7: Add patient demographics
 # ==============================================================================
 
 message("\n== Adding patient demographics ==")
@@ -546,7 +601,7 @@ rm(pt_dups, cohort_demographics)
 gc()
 
 # ==============================================================================
-# STEP 5: Add Elixhauser comorbidities
+# STEP 8: Add Elixhauser comorbidities
 # ==============================================================================
 
 message("  Adding Elixhauser comorbidities...")
@@ -584,7 +639,7 @@ rm(elix, vw, unused_vect)
 gc()
 
 # ==============================================================================
-# STEP 6: Add hospital info and IMV/CRRT times
+# STEP 9: Add hospital info and IMV/CRRT times
 # ==============================================================================
 
 message("  Adding hospital and organ support info...")
@@ -645,17 +700,47 @@ crrt =
 
 cohort = join(cohort, crrt, how = "left", multiple = FALSE)
 
-rm(hospital, resp, crrt)
+## ICU admission time ----------------------------------------------------------
+
+icu_admit = 
+  dplyr::filter(data_list$adt, hospitalization_id %in% cohort_hids) |>
+  dplyr::filter(tolower(location_category) == "icu") |>
+  dplyr::select(hospitalization_id, in_dttm) |>
+  dplyr::collect() |>
+  join(hid_jid_crosswalk, how = "inner", multiple = TRUE) |>
+  fselect(joined_hosp_id, in_dttm) |>
+  distinct()
+
+icu_admit = 
+  join(icu_admit, date_frame, how = "inner", multiple = TRUE) |>
+  fsubset(in_dttm >= admission_dttm) |>
+  fsubset(in_dttm <= discharge_dttm) |>
+  roworder(in_dttm) |>
+  fgroup_by(joined_hosp_id) |>
+  fsummarize(icu_admit_dttm = ffirst(in_dttm))
+
+cohort = join(cohort, icu_admit, how = "left", multiple = FALSE)
+
+# calculate ICU LOS to T0
+cohort = ftransform(cohort,
+                    icu_los_to_t0_h = as.numeric(difftime(t0_dttm, icu_admit_dttm, units = "hours"))
+)
+
+rm(hospital, resp, crrt, icu_admit)
 gc()
 
 # ==============================================================================
-# STEP 7: Save outputs
+# STEP 10: Save outputs
 # ==============================================================================
 
 message("\n== Saving outputs ==")
 
 cohort = 
   distinct(cohort) |>
+  mutate(across(
+    .cols = ends_with("category"),
+    .fns  = ~as.character(.x)
+  )) |>
   mutate(across(
     .cols = ends_with("category"),
     .fns  = ~if_else(is.na(.x), "unknown", tolower(.x))
@@ -673,7 +758,23 @@ message(sprintf("  ✅ Saved cohort.parquet: %d encounters, %d patients",
 message("  ✅ Saved hid_jid_crosswalk.parquet")
 message("  ✅ Saved vasoactive_doses.parquet")
 
+## save exclusion cascade ------------------------------------------------------
+
+exclusions$site = site_lowercase
+exclusions$pct_of_start = round(exclusions$n_remaining / exclusions$n_remaining[1] * 100, 1)
+
+# ensure upload_to_box directory exists
+if (!dir.exists(here("upload_to_box"))) {
+  dir.create(here("upload_to_box"), recursive = TRUE)
+}
+
+fwrite(exclusions, here("proj_tables", "exclusion_cascade.csv"))
+fwrite(exclusions, here("upload_to_box", sprintf("exclusion_cascade_%s.csv", site_lowercase)))
+
+message("  ✅ Saved exclusion_cascade.csv")
+message("\n  Exclusion cascade:")
+print(exclusions[, .(step, n_remaining, n_excluded, pct_of_start)])
+
 message("\n== 01_cohort.R complete ==")
 
 # go to 02
-
