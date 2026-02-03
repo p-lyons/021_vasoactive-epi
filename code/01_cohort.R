@@ -140,7 +140,13 @@ cohort_pats       = funique(hid_jid_crosswalk$patient_id)
 #### pull additional data for cohort filtering and final variables
 cohort_data = 
   dplyr::filter(data_list$hospitalization, hospitalization_id %in% cohort_hids) |>
-  dplyr::select(ends_with("id"), age_at_admission, discharge_category, census_block_code) |> 
+  dplyr::select(
+    ends_with("id"), 
+    age_at_admission, 
+    discharge_category, 
+    census_block_code,
+    census_block_group_code
+  ) |> 
   dplyr::collect()
 
 hid_dups_source =
@@ -161,11 +167,12 @@ cohort =
   roworder(admission_dttm) |>
   fgroup_by(patient_id, joined_hosp_id) |>
   fsummarize(
-    age                = ffirst(age_at_admission),
-    admission_dttm     = ffirst(admission_dttm),
-    discharge_dttm     = flast(discharge_dttm),
-    census_block_code  = ffirst(census_block_code),
-    discharge_category = flast(discharge_category)
+    age                     = ffirst(age_at_admission),
+    admission_dttm          = ffirst(admission_dttm),
+    discharge_dttm          = flast(discharge_dttm),
+    census_block_code       = ffirst(census_block_code),
+    census_block_group_code = ffirst(census_block_group_code),
+    discharge_category      = flast(discharge_category)
   )
 
 #### clean up temporary variables
