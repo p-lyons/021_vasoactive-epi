@@ -310,6 +310,11 @@ code_status_raw =
   dplyr::collect() |>
   distinct()
 
+# ensure character type (Arrow may return dictionary/factor)
+code_status_raw = ftransform(code_status_raw,
+                             code_status_category = as.character(code_status_category)
+)
+
 # standardize code status categories
 code_status_raw = ftransform(code_status_raw,
                              code_status_category = tolower(code_status_category) |>
@@ -515,28 +520,32 @@ cohort = ftransform(cohort,
 # ==============================================================================
 
 message("  Finalizing outcome groups...")
-
-## death/hospice flag ----------------------------------------------------------
+ 
+## 48h death/hospice flag (for outcome grouping) -------------------------------
+## Patient died or discharged to hospice WITHIN 48h of T0
 
 cohort = ftransform(cohort,
-                    dead_hospice_01 = fifelse(dead_01 == 1 | hospice_01 == 1, 1L, 0L)
+                    dead_hospice_48h_01 = fifelse(
+                      (dead_01 == 1 | hospice_01 == 1) & discharge_dttm <= endpoint_dttm, 
+                      1L, 0L
+                    )
 )
 
-cohort$dead_hospice_01 = fifelse(is.na(cohort$dead_hospice_01), 0L, cohort$dead_hospice_01)
-cohort$escalated_01    = fifelse(is.na(cohort$escalated_01), 0L, cohort$escalated_01)
+cohort$dead_hospice_48h_01 = fifelse(is.na(cohort$dead_hospice_48h_01), 0L, cohort$dead_hospice_48h_01)
+cohort$escalated_01        = fifelse(is.na(cohort$escalated_01), 0L, cohort$escalated_01)
 
 ## three-level outcome ---------------------------------------------------------
 
-# Group 1: Died/hospice (regardless of escalation)
-# Group 2: Escalated + alive
-# Group 3: No escalation + alive
+# Group 1: Died/hospice within 48h (regardless of escalation)
+# Group 2: Escalated within 48h + alive at 48h
+# Group 3: No escalation within 48h + alive at 48h
 
 cohort = ftransform(cohort,
                     outcome_group = case_when(
-                      dead_hospice_01 == 1                     ~ "dead_hospice",
-                      escalated_01 == 1 & dead_hospice_01 == 0 ~ "escalated",
-                      escalated_01 == 0 & dead_hospice_01 == 0 ~ "stable",
-                      TRUE                                     ~ "other"
+                      dead_hospice_48h_01 == 1                       ~ "dead_hospice",
+                      escalated_01 == 1 & dead_hospice_48h_01 == 0   ~ "escalated",
+                      escalated_01 == 0 & dead_hospice_48h_01 == 0   ~ "stable",
+                      TRUE                                           ~ "other"
                     )
 )
 
