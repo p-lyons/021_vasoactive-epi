@@ -7,7 +7,6 @@
 # Requires: data_list, site_lowercase, project_location from 00_setup.R
 
 if (!exists("data_list")) {
-  
   stop("data_list not found. Run 00_setup.R first.", call. = FALSE)
 }
 
