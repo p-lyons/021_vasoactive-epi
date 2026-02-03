@@ -35,6 +35,7 @@ cont_vars = c(
   "vp_dose_t0",
   "max_ne_equiv_48h",
   "los_hosp_d",
+  "los_from_t0_d",
   "svi_percentile",
   "adi_percentile"
 )
@@ -89,6 +90,7 @@ binary_vars = c(
   "imv_at_t0_01",
   "imv_48h_01",
   "crrt_01",
+  "crrt_at_t0_01",
   "code_documented_01",
   "dead_01",
   "hospice_01"
@@ -130,6 +132,10 @@ cat_vars = c(
 
 # function: cell counts for categorical variable
 summarize_categorical = function(df, var, group_var = "outcome_group") {
+  # ensure variable is character (not factor with integer storage)
+  df = copy(df)
+  df[, (var) := as.character(get(var))]
+  
   result = df[!is.na(get(group_var)) & get(group_var) != "other", .N, by = c(group_var, var)]
   result[, variable := var]
   setnames(result, var, "category")
@@ -251,6 +257,140 @@ flow_diagram = data.table(
 )
 
 # ==============================================================================
+# QC DIAGNOSTICS
+# ==============================================================================
+
+message("  Creating QC diagnostics...")
+
+## missingness report ----------------------------------------------------------
+
+all_vars = c(
+  "age", "female_01", "race_category", "ethnicity_category", "vw",
+  "code_status_t0", "los_to_t0_d", "icu_los_to_t0_d", 
+  "ne_dose_t0", "vp_dose_t0", "max_ne_equiv_48h",
+  "svi_percentile", "adi_percentile", "los_hosp_d",
+  "imv_dttm", "crrt_dttm", "census_block_code"
+)
+
+qc_missing = data.table(
+  variable = all_vars,
+  n_total  = nrow(cohort_dt),
+  n_miss   = sapply(all_vars, function(v) {
+    if (v %in% names(cohort_dt)) sum(is.na(cohort_dt[[v]])) else NA_integer_
+  }),
+  site = site_lowercase
+)
+qc_missing[, pct_miss := round(n_miss / n_total * 100, 1)]
+
+## continuous variable ranges --------------------------------------------------
+
+cont_vars_qc = c("age", "vw", "los_to_t0_d", "icu_los_to_t0_d", 
+                 "ne_dose_t0", "vp_dose_t0", "max_ne_equiv_48h",
+                 "svi_percentile", "adi_percentile", "los_hosp_d")
+
+qc_ranges = rbindlist(lapply(cont_vars_qc, function(v) {
+  if (v %in% names(cohort_dt)) {
+    data.table(
+      variable = v,
+      n        = sum(!is.na(cohort_dt[[v]])),
+      min      = min(cohort_dt[[v]], na.rm = TRUE),
+      p01      = quantile(cohort_dt[[v]], 0.01, na.rm = TRUE),
+      p25      = quantile(cohort_dt[[v]], 0.25, na.rm = TRUE),
+      median   = median(cohort_dt[[v]], na.rm = TRUE),
+      p75      = quantile(cohort_dt[[v]], 0.75, na.rm = TRUE),
+      p99      = quantile(cohort_dt[[v]], 0.99, na.rm = TRUE),
+      max      = max(cohort_dt[[v]], na.rm = TRUE),
+      site     = site_lowercase
+    )
+  }
+}), fill = TRUE)
+
+## plausibility flags ----------------------------------------------------------
+
+qc_flags = data.table(
+  check = c(
+    "age_under_18",
+    "age_over_110",
+    "ne_dose_over_5",
+    "vp_dose_over_0.1",
+    "los_negative",
+    "t0_before_admission",
+    "t0_after_discharge",
+    "endpoint_after_discharge"
+  ),
+  n_flagged = c(
+    sum(cohort_dt$age < 18, na.rm = TRUE),
+    sum(cohort_dt$age > 110, na.rm = TRUE),
+    sum(cohort_dt$ne_dose_t0 > 5, na.rm = TRUE),
+    sum(cohort_dt$vp_dose_t0 > 0.1, na.rm = TRUE),
+    sum(cohort_dt$los_to_t0_d < 0, na.rm = TRUE),
+    sum(cohort_dt$t0_dttm < cohort_dt$admission_dttm, na.rm = TRUE),
+    sum(cohort_dt$t0_dttm > cohort_dt$discharge_dttm, na.rm = TRUE),
+    sum(cohort_dt$endpoint_dttm > cohort_dt$discharge_dttm, na.rm = TRUE)
+  ),
+  site = site_lowercase
+)
+
+## categorical value inventory -------------------------------------------------
+
+cat_vars_qc = c("race_category", "ethnicity_category", "code_status_t0", 
+                "discharge_category", "outcome_group")
+
+qc_categories = rbindlist(lapply(cat_vars_qc, function(v) {
+  if (v %in% names(cohort_dt)) {
+    cohort_dt[, .(n = .N), by = c(v)][, .(
+      variable = v,
+      category = get(v),
+      n        = n,
+      site     = site_lowercase
+    )]
+  }
+}), fill = TRUE)
+
+## site diagnostics summary ----------------------------------------------------
+
+# Key metrics for cross-site validation
+qc_diagnostics = data.table(
+  metric = c(
+    "n_encounters",
+    "n_patients",
+    "study_start",
+    "study_end",
+    "pct_female",
+    "median_age",
+    "pct_dead_hospice",
+    "pct_escalated",
+    "pct_svi_linked",
+    "pct_adi_linked",
+    "pct_code_documented",
+    "median_ne_dose_t0",
+    "median_vp_dose_t0",
+    "median_los_to_t0_h",
+    "pct_imv_at_t0",
+    "pct_crrt"
+  ),
+  value = c(
+    nrow(cohort_dt),
+    uniqueN(cohort_dt$patient_id),
+    as.character(min(cohort_dt$t0_dttm, na.rm = TRUE)),
+    as.character(max(cohort_dt$t0_dttm, na.rm = TRUE)),
+    round(mean(cohort_dt$female_01, na.rm = TRUE) * 100, 1),
+    round(median(cohort_dt$age, na.rm = TRUE), 1),
+    round(mean(cohort_dt$outcome_group == "dead_hospice", na.rm = TRUE) * 100, 1),
+    round(mean(cohort_dt$outcome_group == "escalated", na.rm = TRUE) * 100, 1),
+    round(mean(!is.na(cohort_dt$svi_percentile)) * 100, 1),
+    round(mean(!is.na(cohort_dt$adi_percentile)) * 100, 1),
+    round(mean(cohort_dt$code_documented_01, na.rm = TRUE) * 100, 1),
+    round(median(cohort_dt$ne_dose_t0, na.rm = TRUE), 3),
+    round(median(cohort_dt$vp_dose_t0, na.rm = TRUE), 4),
+    round(median(cohort_dt$los_to_t0_d, na.rm = TRUE) * 24, 1),
+    round(mean(cohort_dt$imv_at_t0_01, na.rm = TRUE) * 100, 1),
+    round(mean(cohort_dt$crrt_01, na.rm = TRUE) * 100, 1)
+  ),
+  site = site_lowercase
+)
+
+# ==============================================================================
 # SAVE OUTPUTS
 # ==============================================================================
 
@@ -266,6 +406,13 @@ fwrite(t1_timing,      file.path(output_dir, sprintf("table1_timing_%s.csv",    
 fwrite(t1_totals,      file.path(output_dir, sprintf("table1_totals_%s.csv",      site_lowercase)))
 fwrite(flow_diagram,   file.path(output_dir, sprintf("flow_diagram_%s.csv",       site_lowercase)))
 
+# QC outputs
+fwrite(qc_missing,     file.path(output_dir, sprintf("qc_missing_%s.csv",     site_lowercase)))
+fwrite(qc_ranges,      file.path(output_dir, sprintf("qc_ranges_%s.csv",      site_lowercase)))
+fwrite(qc_flags,       file.path(output_dir, sprintf("qc_flags_%s.csv",       site_lowercase)))
+fwrite(qc_categories,  file.path(output_dir, sprintf("qc_categories_%s.csv",  site_lowercase)))
+fwrite(qc_diagnostics, file.path(output_dir, sprintf("qc_diagnostics_%s.csv", site_lowercase)))
+
 message(sprintf("  ✅ Saved to: %s", output_dir))
 message("    - table1_continuous_*.csv  (n, sum, sumsq, percentiles by group)")
 message("    - table1_binary_*.csv      (n, n_1 by group)")
@@ -273,5 +420,6 @@ message("    - table1_categorical_*.csv (cell counts by group)")
 message("    - table1_timing_*.csv      (n_0, n_1, n_2 by group)")
 message("    - table1_totals_*.csv      (group sizes)")
 message("    - flow_diagram_*.csv       (cohort flow)")
+message("    - qc_*.csv                 (QC diagnostics)")
 
 message("\n== 03_table.R complete ==")
