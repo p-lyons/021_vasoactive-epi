@@ -520,7 +520,7 @@ cohort = ftransform(cohort,
 # ==============================================================================
 
 message("  Finalizing outcome groups...")
- 
+
 ## 48h death/hospice flag (for outcome grouping) -------------------------------
 ## Patient died or discharged to hospice WITHIN 48h of T0
 
