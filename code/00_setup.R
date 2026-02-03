@@ -43,8 +43,7 @@ invisible(lapply(packages_to_install, fn_install_if_missing))
 invisible(lapply(packages_to_load, fn_load_quiet))
 options(dplyr.summarise.inform = FALSE)
 
-rm(packages_to_install, packages_to_load, fn_install_if_missing, fn_load_quiet)
-gc()
+rm(packages_to_install, packages_to_load, fn_install_if_missing, fn_load_quiet); gc()
 
 # environment ------------------------------------------------------------------
 
@@ -91,7 +90,6 @@ Sys.setenv(ARROW_NUM_THREADS     = n_threads)
 options(mc.cores                 = n_threads)
 
 message(
-
   sprintf(
     "Environment OK | OS=%s | Cores=%d | Threads=%d | RAM≈%s GB",
     os_type, all_cores, n_threads,
@@ -169,8 +167,10 @@ required_tables = c(
   "vitals",
   "labs",
   "medication_admin_continuous",
+  "medication_admin_intermittent",
   "respiratory_support",
-  "crrt_therapy"
+  "crrt_therapy",
+  "code_status"
 )
 
 ## check available tables ------------------------------------------------------
@@ -373,12 +373,17 @@ dx_spec = list(
   req_values = list(diagnosis_code_format = c("ICD10CM"))
 )
 
-med_spec = list(
+med_spec_c = list(
   table_name = "medication_admin_continuous",
   req_vars   = c("hospitalization_id", "admin_dttm", "med_category", "med_dose", "med_dose_unit"),
   req_values = list(
-    med_category = c("norepinephrine", "vasopressin", "epinephrine", "phenylephrine", "dopamine")
+    med_category = c("norepinephrine", "vasopressin", "epinephrine", "phenylephrine")
   )
+)
+
+med_spec_i = list(
+  table_name = "medication_admin_intermittent",
+  req_vars   = c("hospitalization_id", "admin_dttm", "med_category", "med_dose", "med_dose_unit")
 )
 
 resp_spec = list(
@@ -387,21 +392,34 @@ resp_spec = list(
   req_values = list(device_category = c("IMV"))
 )
 
+code_spec = list(
+  table_name = "code_status",
+  req_vars   = c("patient_id", "start_dttm", "code_status_category")
+)
+
+crrt_spec = list(
+  table_name = "crrt_therapy",
+  req_vars   = c("hospitalization_id", "recorded_dttm")
+)
+ 
 validation_specs = list(
   patient_spec,
   hosp_spec,
   adt_spec,
   dx_spec,
-  med_spec,
-  resp_spec
+  med_spec_c,
+  med_spec_i,
+  resp_spec,
+  code_spec,
+  crrt_spec
 )
 
 ## run validation --------------------------------------------------------------
 
 validate_all_tables(data_list, validation_specs)
 
-rm(patient_spec, hosp_spec, adt_spec, dx_spec, med_spec, resp_spec, validation_specs)
-gc()
+rm(patient_spec, hosp_spec, adt_spec, dx_spec, resp_spec, validation_specs)
+rm(crrt_spec, code_spec, med_spec_c, med_spec_i); gc()
 
 message("\n✅ 00_setup.R complete. Proceed to 01_cohort.R")
 
