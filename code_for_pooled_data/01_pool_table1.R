@@ -133,7 +133,8 @@ message("\n== Building Table 1 ==")
 
 ## variable labels -------------------------------------------------------------
 
-var_labels = data.table(
+# CHARACTERISTICS (top half)
+char_labels = data.table(
   variable = c(
     "n_total",
     "age",
@@ -141,94 +142,64 @@ var_labels = data.table(
     "race_category",
     "ethnicity_category",
     "vw",
+    "svi_percentile",
+    "adi_percentile",
     "code_status_t0",
-    "code_documented_01",
     "los_to_t0_d",
     "icu_los_to_t0_d",
-    "ne_dose_t0",
-    "vp_dose_t0",
+    "imv_at_t0_01",
+    "crrt_at_t0_01"
+  ),
+  label = c(
+    "N",
+    "Age, years, mean (SD)",
+    "Female, n (%)",
+    "Race, n (%)",
+    "Ethnicity, n (%)",
+    "Van Walraven comorbidity score, mean (SD)",
+    "Social Vulnerability Index, mean (SD)",
+    "Area Deprivation Index, mean (SD)",
+    "Code status at study entry, n (%)",
+    "Time in hospital before study entry, days, mean (SD)",
+    "Time in ICU before study entry, days, mean (SD)",
+    "Invasive mechanical ventilation at study entry, n (%)",
+    "Continuous renal replacement therapy at study entry, n (%)"
+  ),
+  sort_order = 1:13,
+  section = "characteristics"
+)
+
+# OUTCOMES (bottom half)
+outcome_labels = data.table(
+  variable = c(
+    "dead_01",
+    "hospice_01",
+    "los_from_t0_d",
     "max_ne_equiv_48h",
     "epi_01",
     "phenyl_01",
     "dopa_01",
     "a2_01",
     "mb_01",
-    "b12_01",
-    "imv_timing_group",
-    "imv_at_t0_01",
-    "imv_48h_01",
-    "crrt_timing_group",
-    "crrt_01",
-    "svi_percentile",
-    "adi_percentile",
-    "los_hosp_d",
-    "dead_01",
-    "hospice_01"
+    "b12_01"
   ),
   label = c(
-    "N",
-    "Age, years",
-    "Female sex",
-    "Race",
-    "Ethnicity",
-    "Van Walraven score",
-    "Code status at T0",
-    "Code status documented",
-    "LOS to T0, days",
-    "ICU LOS to T0, days",
-    "Norepinephrine dose at T0, mcg/kg/min",
-    "Vasopressin dose at T0, units/min",
-    "Max NE equivalent, mcg/kg/min",
-    "Epinephrine",
-    "Phenylephrine",
-    "Dopamine",
-    "Angiotensin II",
-    "Methylene blue",
-    "Hydroxocobalamin (B12)",
-    "IMV timing",
-    "IMV at T0",
-    "IMV within 48h",
-    "CRRT timing",
-    "CRRT",
-    "SVI percentile",
-    "ADI percentile",
-    "Hospital LOS, days",
-    "Died in hospital",
-    "Discharged to hospice"
+    "Died in hospital, n (%)",
+    "Discharged to hospice, n (%)",
+    "Length of stay from study entry, days, mean (SD)",
+    "Maximum norepinephrine equivalent dose, mcg/kg/min, mean (SD)",
+    "Received epinephrine, n (%)",
+    "Received phenylephrine, n (%)",
+    "Received dopamine, n (%)",
+    "Received angiotensin II, n (%)",
+    "Received methylene blue, n (%)",
+    "Received hydroxocobalamin, n (%)"
   ),
-  section = c(
-    "header",
-    "demographics",
-    "demographics",
-    "demographics",
-    "demographics",
-    "comorbidities",
-    "code_status",
-    "code_status",
-    "timing",
-    "timing",
-    "vasopressors",
-    "vasopressors",
-    "vasopressors",
-    "escalation",
-    "escalation",
-    "escalation",
-    "escalation",
-    "escalation",
-    "escalation",
-    "organ_support",
-    "organ_support",
-    "organ_support",
-    "organ_support",
-    "organ_support",
-    "sdoh",
-    "sdoh",
-    "outcomes",
-    "outcomes",
-    "outcomes"
-  ),
-  sort_order = 1:29
+  sort_order = 101:110,
+  section = "outcomes"
 )
+
+var_labels = rbindlist(list(char_labels, outcome_labels))
 
 ## N row -----------------------------------------------------------------------
 
@@ -245,8 +216,17 @@ for (col in names(OUTCOME_LABELS)) {
 
 ## continuous variables wide ---------------------------------------------------
 
+# Filter to only variables we want
+cont_vars_keep = c("age", "vw", "svi_percentile", "adi_percentile", 
+                   "los_to_t0_d", "icu_los_to_t0_d", "los_from_t0_d", "max_ne_equiv_48h")
+
+cont_filtered = cont_pooled[variable %in% cont_vars_keep]
+
+# Special formatting for vw (round to integer)
+cont_filtered[variable == "vw", formatted := paste0(round(mean, 0), " (", round(sd, 0), ")")]
+
 cont_wide = dcast(
-  cont_pooled, 
+  cont_filtered, 
   variable ~ outcome_group, 
   value.var = "formatted"
 )
@@ -254,8 +234,15 @@ cont_wide[, category := NA_character_]
 
 ## binary variables wide -------------------------------------------------------
 
+# Filter to only variables we want
+binary_vars_keep = c("female_01", "imv_at_t0_01", "crrt_at_t0_01", 
+                     "dead_01", "hospice_01",
+                     "epi_01", "phenyl_01", "dopa_01", "a2_01", "mb_01", "b12_01")
+
+binary_filtered = binary_pooled[variable %in% binary_vars_keep]
+
 binary_wide = dcast(
-  binary_pooled,
+  binary_filtered,
   variable ~ outcome_group,
   value.var = "formatted"
 )
@@ -263,35 +250,44 @@ binary_wide[, category := NA_character_]
 
 ## categorical variables wide --------------------------------------------------
 
+# Only race, ethnicity, code_status_t0
+cat_vars_keep = c("race_category", "ethnicity_category", "code_status_t0")
+
+cat_filtered = cat_pooled[variable %in% cat_vars_keep]
+
+# Clean up code status labels
+cat_filtered[variable == "code_status_t0", category := fcase(
+  category == "full",     "Full code",
+  category == "dnr_dni",  "DNR/DNI",
+  category == "partial",  "Partial limitations",
+  category == "other",    "Other",
+  default = category
+)]
+
+# Clean up race labels (title case)
+cat_filtered[variable == "race_category", category := fcase(
+  tolower(category) == "white",                                     "White",
+  tolower(category) == "black or african american",                 "Black or African American",
+  tolower(category) == "asian",                                     "Asian",
+  tolower(category) == "american indian or alaska native",          "American Indian or Alaska Native",
+  tolower(category) == "native hawaiian or other pacific islander", "Native Hawaiian or Other Pacific Islander",
+  tolower(category) %in% c("other", "unknown", "other/unknown"),    "Other/Unknown",
+  default = category
+)]
+
+# Clean up ethnicity labels
+cat_filtered[variable == "ethnicity_category", category := fcase(
+  tolower(category) == "hispanic",                        "Hispanic",
+  tolower(category) %in% c("non-hispanic", "non_hispanic"), "Non-Hispanic",
+  tolower(category) == "unknown",                         "Unknown",
+  default = category
+)]
+
 cat_wide = dcast(
-  cat_pooled,
+  cat_filtered,
   variable + category ~ outcome_group,
   value.var = "formatted"
 )
-
-## timing variables - reshape to categorical format ----------------------------
-
-# IMV timing
-imv_timing = timing_pooled[variable == "imv_timing_group"]
-
-imv_timing_long = rbindlist(list(
-  imv_timing[, .(outcome_group, variable = "imv_timing_group", category = "None",       formatted = formatted_0)],
-  imv_timing[, .(outcome_group, variable = "imv_timing_group", category = "Before T0",  formatted = formatted_1)],
-  imv_timing[, .(outcome_group, variable = "imv_timing_group", category = "T0 to 48h",  formatted = formatted_2)]
-))
-
-imv_timing_wide = dcast(imv_timing_long, variable + category ~ outcome_group, value.var = "formatted")
-
-# CRRT timing
-crrt_timing = timing_pooled[variable == "crrt_timing_group"]
-
-crrt_timing_long = rbindlist(list(
-  crrt_timing[, .(outcome_group, variable = "crrt_timing_group", category = "None",       formatted = formatted_0)],
-  crrt_timing[, .(outcome_group, variable = "crrt_timing_group", category = "Before T0",  formatted = formatted_1)],
-  crrt_timing[, .(outcome_group, variable = "crrt_timing_group", category = "T0 to 48h",  formatted = formatted_2)]
-))
-
-crrt_timing_wide = dcast(crrt_timing_long, variable + category ~ outcome_group, value.var = "formatted")
 
 ## combine all -----------------------------------------------------------------
 
@@ -299,9 +295,7 @@ all_data = rbindlist(list(
   n_row,
   cont_wide,
   binary_wide,
-  cat_wide,
-  imv_timing_wide,
-  crrt_timing_wide
+  cat_wide
 ), fill = TRUE)
 
 ## merge labels ----------------------------------------------------------------
@@ -310,9 +304,7 @@ all_data = merge(all_data, var_labels, by = "variable", all.x = TRUE)
 
 ## create display column -------------------------------------------------------
 
-# Variables that are categorical (need header row + indented categories)
-categorical_vars = c("race_category", "ethnicity_category", "code_status_t0", 
-                     "imv_timing_group", "crrt_timing_group")
+categorical_vars = c("race_category", "ethnicity_category", "code_status_t0")
 
 all_data[, display := fcase(
   variable == "n_total",                               "N",
@@ -349,39 +341,107 @@ all_data[is.na(sort_order), sort_order := 999]
 all_data[, cat_order := fifelse(is.na(category), 0, 1)]
 setorder(all_data, sort_order, cat_order, category, na.last = FALSE)
 
-## final table -----------------------------------------------------------------
+## split into characteristics and outcomes -------------------------------------
 
-# Select and rename columns
 outcome_cols = intersect(names(OUTCOME_LABELS), names(all_data))
 
-table1 = all_data[, c("display", outcome_cols), with = FALSE]
+# Characteristics table (sort_order < 100)
+char_data = all_data[sort_order < 100]
+table1_char = char_data[, c("display", outcome_cols), with = FALSE]
+setnames(table1_char, outcome_cols, OUTCOME_LABELS[outcome_cols])
+setnames(table1_char, "display", "Characteristic")
+table1_char = table1_char[!is.na(Characteristic)]
+
+# Outcomes table (sort_order >= 100)
+outcome_data = all_data[sort_order >= 100]
+table1_outcomes = outcome_data[, c("display", outcome_cols), with = FALSE]
+setnames(table1_outcomes, outcome_cols, OUTCOME_LABELS[outcome_cols])
+setnames(table1_outcomes, "display", "Outcome")
+table1_outcomes = table1_outcomes[!is.na(Outcome)]
+
+message("  Characteristics table: ", nrow(table1_char), " rows")
+message("  Outcomes table: ", nrow(table1_outcomes), " rows")
+
+# Combined for full table export
+table1 = all_data[, c("display", "section", outcome_cols), with = FALSE]
 setnames(table1, outcome_cols, OUTCOME_LABELS[outcome_cols])
 setnames(table1, "display", "Variable")
-
-# Remove rows with all NA outcome columns (shouldn't happen but safety check)
 table1 = table1[!is.na(Variable)]
 
-message("  Table 1 created with ", nrow(table1), " rows")
+message("  Combined Table 1: ", nrow(table1), " rows")
 
 # ==============================================================================
-# CREATE FLEXTABLE
+# CREATE FLEXTABLES
 # ==============================================================================
 
-message("\n== Formatting table ==")
+message("\n== Formatting tables ==")
 
-ft1 = flextable(table1) |>
-  set_header_labels(Variable = "") |>
+## Characteristics table -------------------------------------------------------
+
+ft_char = flextable(table1_char) |>
+  set_header_labels(Characteristic = "") |>
   autofit() |>
-  align(j = 2:ncol(table1), align = "center", part = "all") |>
+  align(j = 2:ncol(table1_char), align = "center", part = "all") |>
   bold(i = 1, part = "body") |>  # N row
   hline(i = 1, border = fp_border(width = 1), part = "body") |>
   fontsize(size = 10, part = "all") |>
   padding(padding = 2, part = "all")
 
-# Add section headers (bold the category headers)
-cat_header_rows = which(table1$Variable %in% var_labels[variable %in% categorical_vars, label])
-if (length(cat_header_rows) > 0) {
-  ft1 = bold(ft1, i = cat_header_rows, j = 1)
+# Bold the category headers
+cat_header_rows_char = which(table1_char$Characteristic %in% var_labels[variable %in% categorical_vars, label])
+if (length(cat_header_rows_char) > 0) {
+  ft_char = bold(ft_char, i = cat_header_rows_char, j = 1)
+}
+
+## Outcomes table --------------------------------------------------------------
+
+ft_outcomes = flextable(table1_outcomes) |>
+  set_header_labels(Outcome = "") |>
+  autofit() |>
+  align(j = 2:ncol(table1_outcomes), align = "center", part = "all") |>
+  fontsize(size = 10, part = "all") |>
+  padding(padding = 2, part = "all")
+
+## Combined table (for single document) ----------------------------------------
+
+# Add a section separator row
+separator_row = data.table(
+  Variable = "Outcomes",
+  section = "separator"
+)
+for (col in names(OUTCOME_LABELS)) {
+  nm = OUTCOME_LABELS[col]
+  if (nm %in% names(table1)) {
+    separator_row[[nm]] = ""
+  }
+}
+
+# Find where outcomes start and insert separator
+char_rows = table1[section == "characteristics"]
+outcome_rows = table1[section == "outcomes"]
+table1_combined = rbindlist(list(char_rows, separator_row, outcome_rows), fill = TRUE)
+table1_combined[, section := NULL]
+
+ft_combined = flextable(table1_combined) |>
+  set_header_labels(Variable = "") |>
+  autofit() |>
+  align(j = 2:ncol(table1_combined), align = "center", part = "all") |>
+  bold(i = 1, part = "body") |>  # N row
+  hline(i = 1, border = fp_border(width = 1), part = "body") |>
+  fontsize(size = 10, part = "all") |>
+  padding(padding = 2, part = "all")
+
+# Bold the category headers and section separator
+cat_labels = var_labels[variable %in% categorical_vars, label]
+bold_rows = which(table1_combined$Variable %in% c(cat_labels, "Outcomes"))
+if (length(bold_rows) > 0) {
+  ft_combined = bold(ft_combined, i = bold_rows, j = 1)
+}
+
+# Add line before outcomes section
+outcomes_row = which(table1_combined$Variable == "Outcomes")
+if (length(outcomes_row) > 0) {
+  ft_combined = hline(ft_combined, i = outcomes_row - 1, border = fp_border(width = 1), part = "body")
 }
 
 # ==============================================================================
@@ -390,9 +450,17 @@ if (length(cat_header_rows) > 0) {
 
 message("\n== Saving outputs ==")
 
-# Word document
-save_as_docx(ft1, path = here("output", "tables", paste0("table1_characteristics_", today, ".docx")))
+# Characteristics table
+save_as_docx(ft_char, path = here("output", "tables", paste0("table1_characteristics_", today, ".docx")))
 message("  Saved: table1_characteristics_", today, ".docx")
+
+# Outcomes table
+save_as_docx(ft_outcomes, path = here("output", "tables", paste0("table1_outcomes_", today, ".docx")))
+message("  Saved: table1_outcomes_", today, ".docx")
+
+# Combined table
+save_as_docx(ft_combined, path = here("output", "tables", paste0("table1_combined_", today, ".docx")))
+message("  Saved: table1_combined_", today, ".docx")
 
 # CSV for further analysis
 fwrite(all_data, here("output", "tables", paste0("table1_data_", today, ".csv")))
