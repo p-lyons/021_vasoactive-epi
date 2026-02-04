@@ -338,6 +338,9 @@ cat_vars_keep = c("race_category", "ethnicity_category", "code_status_t0")
 
 cat_filtered = cat_pooled[variable %in% cat_vars_keep]
 
+# Ensure category is character (not factor)
+cat_filtered[, category := as.character(category)]
+
 # Clean up code status labels
 cat_filtered[variable == "code_status_t0", category := fcase(
   category == "full",     "Full code",
@@ -366,11 +369,25 @@ cat_filtered[variable == "ethnicity_category", category := fcase(
   default = category
 )]
 
+# Re-aggregate after label cleaning (some categories may have been merged, e.g. other + unknown -> Other/Unknown)
+cat_filtered = cat_filtered[, .(
+  n   = sum(n, na.rm = TRUE),
+  N   = first(N),
+  pct = sum(n, na.rm = TRUE) / first(N) * 100
+), by = .(outcome_group, variable, category)]
+
+# Re-format after aggregation
+cat_filtered[, formatted := paste0(format_n(n), " (", round(pct, 1), "%)")]
+cat_filtered[is.na(n) | n == 0, formatted := "0 (0%)"]
+
 cat_wide = dcast(
   cat_filtered,
   variable + category ~ outcome_group,
   value.var = "formatted"
 )
+
+# Ensure category stays character after dcast
+cat_wide[, category := as.character(category)]
 
 # Add p-values for categorical variables (only on header row, NA for category rows)
 cat_wide = merge(cat_wide, cat_pvalues, by = "variable", all.x = TRUE)
