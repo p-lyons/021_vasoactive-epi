@@ -66,7 +66,7 @@ calculate_welch_anova_p = function(means, sds, ns) {
   f_stat = f_num / f_den
   
   # Degrees of freedom
-  
+
   df1 = k - 1
   df2 = (k^2 - 1) / (3 * lambda)
   
@@ -502,7 +502,9 @@ message("\n== Formatting tables ==")
 
 ft_char = flextable(table1_char) |>
   set_header_labels(Characteristic = "") |>
-  autofit() |>
+  width(j = 1, width = 2.5) |>
+  width(j = 2:4, width = 1.3) |>
+  width(j = 5, width = 0.7) |>
   align(j = 2:ncol(table1_char), align = "center", part = "all") |>
   bold(i = 1, part = "body") |>  # N row
   hline(i = 1, border = fp_border(width = 1), part = "body") |>
@@ -519,7 +521,9 @@ if (length(cat_header_rows_char) > 0) {
 
 ft_outcomes = flextable(table1_outcomes) |>
   set_header_labels(Outcome = "") |>
-  autofit() |>
+  width(j = 1, width = 2.5) |>
+  width(j = 2:4, width = 1.3) |>
+  width(j = 5, width = 0.7) |>
   align(j = 2:ncol(table1_outcomes), align = "center", part = "all") |>
   fontsize(size = 10, part = "all") |>
   padding(padding = 2, part = "all")
@@ -537,6 +541,7 @@ for (col in names(OUTCOME_LABELS)) {
     separator_row[[nm]] = ""
   }
 }
+separator_row[["P-value"]] = ""
 
 # Find where outcomes start and insert separator
 char_rows = table1[section == "characteristics"]
@@ -546,7 +551,9 @@ table1_combined[, section := NULL]
 
 ft_combined = flextable(table1_combined) |>
   set_header_labels(Variable = "") |>
-  autofit() |>
+  width(j = 1, width = 2.5) |>
+  width(j = 2:4, width = 1.3) |>
+  width(j = 5, width = 0.7) |>
   align(j = 2:ncol(table1_combined), align = "center", part = "all") |>
   bold(i = 1, part = "body") |>  # N row
   hline(i = 1, border = fp_border(width = 1), part = "body") |>
@@ -572,16 +579,25 @@ if (length(outcomes_row) > 0) {
 
 message("\n== Saving outputs ==")
 
-# Characteristics table
-save_as_docx(ft_char, path = here("output", "tables", paste0("table1_characteristics_", today, ".docx")))
+# Create landscape section properties
+landscape_props = prop_section(
+  page_size = page_size(orient = "landscape"),
+  page_margins = page_mar(bottom = 0.5, top = 0.5, left = 0.5, right = 0.5)
+)
+
+# Characteristics table (landscape)
+save_as_docx(ft_char, path = here("output", "tables", paste0("table1_characteristics_", today, ".docx")),
+             pr_section = landscape_props)
 message("  Saved: table1_characteristics_", today, ".docx")
 
-# Outcomes table
-save_as_docx(ft_outcomes, path = here("output", "tables", paste0("table1_outcomes_", today, ".docx")))
+# Outcomes table (landscape)
+save_as_docx(ft_outcomes, path = here("output", "tables", paste0("table1_outcomes_", today, ".docx")),
+             pr_section = landscape_props)
 message("  Saved: table1_outcomes_", today, ".docx")
 
-# Combined table
-save_as_docx(ft_combined, path = here("output", "tables", paste0("table1_combined_", today, ".docx")))
+# Combined table (landscape)
+save_as_docx(ft_combined, path = here("output", "tables", paste0("table1_combined_", today, ".docx")),
+             pr_section = landscape_props)
 message("  Saved: table1_combined_", today, ".docx")
 
 # CSV for further analysis
