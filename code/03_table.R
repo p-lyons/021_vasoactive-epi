@@ -20,15 +20,6 @@ message(sprintf("  Cohort size: %d encounters", nrow(cohort)))
 
 cohort_dt = as.data.table(cohort)
 
-# ensure categorical variables are character (Arrow may load as dictionary/factor)
-cat_cols = c("race_category", "ethnicity_category", "code_status_t0", 
-             "age_cat", "vw_cat", "los_cat", "icu_los_cat", "outcome_group")
-for (col in cat_cols) {
-  if (col %in% names(cohort_dt)) {
-    cohort_dt[, (col) := as.character(get(col))]
-  }
-}
-
 # ==============================================================================
 # CONTINUOUS VARIABLES - poolable stats
 # ==============================================================================
@@ -90,6 +81,9 @@ message("  Summarizing categorical variables...")
 
 binary_vars = c(
   "female_01",
+  "white_01",
+  "hispanic_01",
+  "full_code_01",
   "epi_01",
   "phenyl_01",
   "dopa_01",
@@ -248,15 +242,17 @@ message("  Creating flow diagram...")
 flow_diagram = data.table(
   step = c(
     "Total encounters meeting T0 criteria",
-    "Dead/hospice",
-    "Escalated (alive)",
-    "Stable (no escalation, alive)"
+    "No escalation + dead/hospice",
+    "Escalated + dead/hospice",
+    "Escalated + alive",
+    "No escalation + alive"
   ),
   n = c(
     nrow(cohort_dt[outcome_group != "other"]),
-    sum(cohort_dt$outcome_group == "dead_hospice", na.rm = TRUE),
-    sum(cohort_dt$outcome_group == "escalated", na.rm = TRUE),
-    sum(cohort_dt$outcome_group == "stable", na.rm = TRUE)
+    sum(cohort_dt$outcome_group == "noesc_dead", na.rm = TRUE),
+    sum(cohort_dt$outcome_group == "esc_dead", na.rm = TRUE),
+    sum(cohort_dt$outcome_group == "esc_alive", na.rm = TRUE),
+    sum(cohort_dt$outcome_group == "noesc_alive", na.rm = TRUE)
   ),
   site = site_lowercase
 )
@@ -381,8 +377,8 @@ qc_diagnostics = data.table(
     as.character(max(cohort_dt$t0_dttm, na.rm = TRUE)),
     round(mean(cohort_dt$female_01, na.rm = TRUE) * 100, 1),
     round(median(cohort_dt$age, na.rm = TRUE), 1),
-    round(mean(cohort_dt$outcome_group == "dead_hospice", na.rm = TRUE) * 100, 1),
-    round(mean(cohort_dt$outcome_group == "escalated", na.rm = TRUE) * 100, 1),
+    round(mean(cohort_dt$outcome_group %in% c("noesc_dead", "esc_dead"), na.rm = TRUE) * 100, 1),
+    round(mean(cohort_dt$outcome_group %in% c("esc_dead", "esc_alive"), na.rm = TRUE) * 100, 1),
     round(mean(!is.na(cohort_dt$svi_percentile)) * 100, 1),
     round(mean(!is.na(cohort_dt$adi_percentile)) * 100, 1),
     round(mean(cohort_dt$code_documented_01, na.rm = TRUE) * 100, 1),

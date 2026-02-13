@@ -194,18 +194,39 @@ cohort = join(cohort, t0_doses, how = "left", multiple = FALSE)
 
 message("  Calculating max NE equivalent...")
 
-# NE equivalent: NE 1:1, Epi 1:1, VP 2.5 per 0.01 units/min, Phenyl 0.1:1, A2 0.01:1
-
 dose_in_window = 
   join(va, date_frame, how = "inner", multiple = TRUE) |>
   fsubset(admin_dttm >= t0_dttm & admin_dttm <= endpoint_dttm)
 
+# Cap doses at clinically plausible maximums before calculating NE-equiv
+dose_caps = list(
+  ne_dose     = 5,
+  vp_dose     = 0.1,
+  epi_dose    = 5,
+  phenyl_dose = 2,
+  dopa_dose   = 20,
+  a2_dose     = 80
+)
+
+for (v in names(dose_caps)) {
+  cap_val = dose_caps[[v]]
+  if (v %in% names(dose_in_window)) {
+    n_capped = sum(dose_in_window[[v]] > cap_val, na.rm = TRUE)
+    if (n_capped > 0) {
+      message(sprintf("    ⚠️  Capping %d %s values > %.2f", n_capped, v, cap_val))
+      dose_in_window[get(v) > cap_val, (v) := cap_val]
+    }
+  }
+}
+
+# NE equivalent: NE 1:1, Epi 1:1, VP 2.5×, Phenyl 0.1×, Dopa 0.01×, A2 0.01×
 dose_in_window = ftransform(dose_in_window,
                             ne_equiv = 
                               fifelse(is.na(ne_dose),     0, ne_dose) +
                               fifelse(is.na(epi_dose),    0, epi_dose) +
                               fifelse(is.na(vp_dose),     0, 2.5 * vp_dose) +
                               fifelse(is.na(phenyl_dose), 0, 0.1 * phenyl_dose) +
+                              fifelse(is.na(dopa_dose),   0, 0.01 * dopa_dose) +
                               fifelse(is.na(a2_dose),     0, 0.01 * a2_dose)
 )
 
@@ -217,7 +238,7 @@ max_ne_equiv[is.infinite(max_ne_equiv_48h), max_ne_equiv_48h := NA_real_]
 
 cohort = join(cohort, max_ne_equiv, how = "left", multiple = FALSE)
 
-rm(va, t0_doses, dose_in_window, max_ne_equiv, date_frame)
+rm(va, t0_doses, dose_in_window, max_ne_equiv, date_frame, dose_caps)
 gc()
 
 # ==============================================================================
@@ -310,11 +331,6 @@ code_status_raw =
   dplyr::collect() |>
   distinct()
 
-# ensure character type (Arrow may return dictionary/factor)
-code_status_raw = ftransform(code_status_raw,
-                             code_status_category = as.character(code_status_category)
-)
-
 # standardize code status categories
 code_status_raw = ftransform(code_status_raw,
                              code_status_category = tolower(code_status_category) |>
@@ -397,6 +413,14 @@ cohort = ftransform(cohort,
 message(sprintf("    Code status distribution at T0:"))
 print(table(cohort$code_status_t0, useNA = "ifany"))
 
+# collapsed binary: full code vs any limitation
+cohort = ftransform(cohort,
+                    full_code_01 = fifelse(code_status_t0 == "full", 1L, 0L)
+)
+
+message(sprintf("    Full code: %d (%.1f%%)", 
+                sum(cohort$full_code_01), 100 * mean(cohort$full_code_01)))
+
 rm(code_status_raw, code_status, initial_window, code_at_t0)
 gc()
 
@@ -461,6 +485,38 @@ if (file.exists(adi_file)) {
 
 message("  Creating derived variables...")
 
+## collapsed race: white vs non-white ------------------------------------------
+## Unknown/NA → NA, White → 1, Non-white → 0
+
+cohort = ftransform(cohort,
+                    white_01 = fifelse(
+                      is.na(race_category) | tolower(race_category) == "unknown",
+                      NA_integer_,
+                      fifelse(tolower(race_category) == "white", 1L, 0L)
+                    )
+)
+
+message(sprintf("    White: %d of %d known (%.1f%%)", 
+                sum(cohort$white_01 == 1, na.rm = TRUE),
+                sum(!is.na(cohort$white_01)),
+                100 * mean(cohort$white_01, na.rm = TRUE)))
+
+## collapsed ethnicity: hispanic vs non-hispanic -------------------------------
+## Unknown/NA → NA, Hispanic → 1, Non-Hispanic → 0
+
+cohort = ftransform(cohort,
+                    hispanic_01 = fifelse(
+                      is.na(ethnicity_category) | tolower(ethnicity_category) == "unknown",
+                      NA_integer_,
+                      fifelse(tolower(ethnicity_category) == "hispanic", 1L, 0L)
+                    )
+)
+
+message(sprintf("    Hispanic: %d of %d known (%.1f%%)", 
+                sum(cohort$hispanic_01 == 1, na.rm = TRUE),
+                sum(!is.na(cohort$hispanic_01)),
+                100 * mean(cohort$hispanic_01, na.rm = TRUE)))
+
 ## LOS to T0 -------------------------------------------------------------------
 
 cohort = ftransform(cohort,
@@ -516,13 +572,13 @@ cohort = ftransform(cohort,
 )
 
 # ==============================================================================
-# STEP 9: Outcome groups (3 groups)
+# STEP 9: Outcome groups (4 groups - escalation × death/hospice)
 # ==============================================================================
 
 message("  Finalizing outcome groups...")
+message("    Defining 48h death/hospice window...")
 
-## 48h death/hospice flag (for outcome grouping) -------------------------------
-## Patient died or discharged to hospice WITHIN 48h of T0
+## 48h death/hospice flag (within endpoint window) -----------------------------
 
 cohort = ftransform(cohort,
                     dead_hospice_48h_01 = fifelse(
@@ -534,24 +590,26 @@ cohort = ftransform(cohort,
 cohort$dead_hospice_48h_01 = fifelse(is.na(cohort$dead_hospice_48h_01), 0L, cohort$dead_hospice_48h_01)
 cohort$escalated_01        = fifelse(is.na(cohort$escalated_01), 0L, cohort$escalated_01)
 
-## three-level outcome ---------------------------------------------------------
+## four-level outcome (crossing escalation × death/hospice) --------------------
 
-# Group 1: Died/hospice within 48h (regardless of escalation)
-# Group 2: Escalated within 48h + alive at 48h
-# Group 3: No escalation within 48h + alive at 48h
+# Group 0: No escalation + death/hospice
+# Group 1: Escalated + death/hospice
+# Group 2: Escalated + alive
+# Group 3: No escalation + alive
 
 cohort = ftransform(cohort,
                     outcome_group = case_when(
-                      dead_hospice_48h_01 == 1                       ~ "dead_hospice",
-                      escalated_01 == 1 & dead_hospice_48h_01 == 0   ~ "escalated",
-                      escalated_01 == 0 & dead_hospice_48h_01 == 0   ~ "stable",
-                      TRUE                                           ~ "other"
+                      escalated_01 == 0 & dead_hospice_48h_01 == 1 ~ "noesc_dead",
+                      escalated_01 == 1 & dead_hospice_48h_01 == 1 ~ "esc_dead",
+                      escalated_01 == 1 & dead_hospice_48h_01 == 0 ~ "esc_alive",
+                      escalated_01 == 0 & dead_hospice_48h_01 == 0 ~ "noesc_alive",
+                      TRUE                                         ~ "other"
                     )
 )
 
 cohort = ftransform(cohort,
                     outcome_group = factor(outcome_group, 
-                                           levels = c("dead_hospice", "escalated", "stable", "other"))
+                                           levels = c("noesc_dead", "esc_dead", "esc_alive", "noesc_alive", "other"))
 )
 
 message("\n  Outcome distribution:")
