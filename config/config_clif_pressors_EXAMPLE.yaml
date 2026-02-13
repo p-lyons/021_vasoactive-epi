@@ -1,0 +1,20 @@
+# ==============================================================================
+# config_clif_pressors.yaml
+# CLIF Vasopressor Escalation Study - Site Configuration
+# ==============================================================================
+
+# Site identifier (lowercase)
+# Must match a row in config/clif_sites.csv
+site_lowercase: "yoursite"
+
+# File format of your CLIF tables
+# Options: "parquet", "csv", or "fst"
+file_type: "parquet"
+
+# Path to folder containing CLIF tables
+# Tables should be named: clif_patient.parquet, clif_hospitalization.parquet, etc.
+clif_data_location: "/path/to/your/clif_tables"
+
+# Path to this project folder
+# This is where the R scripts and config folder are located
+project_location: "/path/to/clif_pressors"
