@@ -21,28 +21,28 @@ message(strrep("=", 70), "\n")
 # ==============================================================================
 
 message("\n>>> Running 00_setup.R <<<\n")
-source(here::here("00_setup.R"))
+source(here::here("code/00_setup.R"))
 
 # ==============================================================================
 # 01_cohort.R - Build cohort, link hospitalizations, apply exclusions
 # ==============================================================================
 
 message("\n>>> Running 01_cohort.R <<<\n")
-source(here::here("01_cohort.R"))
+source(here::here("code/01_cohort.R"))
 
 # ==============================================================================
 # 02_variables.R - Define outcomes, escalation, timing groups, derived vars
 # ==============================================================================
 
 message("\n>>> Running 02_variables.R <<<\n")
-source(here::here("02_variables.R"))
+source(here::here("code/02_variables.R"))
 
 # ==============================================================================
 # 03_table.R - Generate poolable Table 1 statistics
 # ==============================================================================
 
 message("\n>>> Running 03_table.R <<<\n")
-source(here::here("03_table.R"))
+source(here::here("code/03_table.R"))
 
 # ==============================================================================
 # Summary

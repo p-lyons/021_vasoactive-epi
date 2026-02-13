@@ -480,7 +480,124 @@ if (file.exists(adi_file)) {
 }
 
 # ==============================================================================
-# STEP 8: Derived variables
+# STEP 8: Academic vs Community Hospital
+# ==============================================================================
+
+message("  Adding hospital type...")
+
+## Get hospital_type from ADT (last location before endpoint) ------------------
+
+adt_hosp = 
+  dplyr::filter(data_list$adt, hospitalization_id %in% cohort_hids) |>
+  dplyr::select(hospitalization_id, in_dttm, hospital_type) |>
+  dplyr::collect() |>
+  as.data.table()
+
+adt_hosp = join(adt_hosp, hid_jid_crosswalk, how = "inner", multiple = TRUE)
+adt_hosp = join(adt_hosp, fselect(cohort, joined_hosp_id, endpoint_dttm), how = "inner", multiple = TRUE)
+
+setorder(adt_hosp, joined_hosp_id, in_dttm)
+
+# Get last hospital_type before endpoint
+last_hosp_type = adt_hosp[
+  !is.na(in_dttm) & !is.na(endpoint_dttm) & in_dttm <= endpoint_dttm,
+  .SD[which.max(in_dttm)],
+  by = joined_hosp_id
+][, .(joined_hosp_id, hospital_type)]
+
+last_hosp_type[, academic_01 := fifelse(
+  tolower(hospital_type) == "academic", 1L,
+  fifelse(tolower(hospital_type) == "community", 0L, NA_integer_)
+)]
+
+cohort = join(cohort, last_hosp_type[, .(joined_hosp_id, academic_01)], how = "left", multiple = FALSE)
+
+message(sprintf("    Academic: %d of %d known (%.1f%%)", 
+                sum(cohort$academic_01 == 1, na.rm = TRUE),
+                sum(!is.na(cohort$academic_01)),
+                100 * mean(cohort$academic_01, na.rm = TRUE)))
+
+rm(adt_hosp, last_hosp_type)
+gc()
+
+# ==============================================================================
+# STEP 9: Major Procedure (OR within 24h before to 1h after T0)
+# ==============================================================================
+
+message("  Adding major procedure status...")
+
+## Load procedure classification file ------------------------------------------
+
+proc_class_file = here("config", "PClassR_v2026-1.csv")
+
+if (file.exists(proc_class_file)) {
+  
+  procedure_codes = fread(proc_class_file)
+  procedure_codes[, procedure_code := gsub("^'(.*)'$", "\\1", procedure_code)]
+  setkey(procedure_codes, procedure_code)
+  
+  ## Pull ICD10PCS procedures for cohort patients ------------------------------
+  
+  procedures_dt = 
+    dplyr::filter(data_list$patient_procedures, hospitalization_id %in% cohort_hids) |>
+    dplyr::filter(procedure_code_format == "ICD10PCS") |>
+    dplyr::select(hospitalization_id, procedure_billed_dttm, procedure_code) |>
+    dplyr::collect() |>
+    as.data.table()
+  
+  procedures_dt = join(procedures_dt, hid_jid_crosswalk, how = "inner", multiple = TRUE)
+  
+  ## Assign procedure class (3 or 4 = major) -----------------------------------
+  
+  procedures_dt[procedure_codes, procedure_class := i.procedure_class, on = "procedure_code"]
+  procedures_dt = procedures_dt[procedure_class %in% c(3, 4)]
+  
+  ## Add T0 and determine timing -----------------------------------------------
+  
+  procedures_dt = join(
+    procedures_dt, 
+    fselect(cohort, joined_hosp_id, t0_dttm), 
+    how = "inner", 
+    multiple = TRUE
+  )
+  
+  # Timing: 0 = after T0+1h, 1 = before T0-24h, 2 = within window (-24h to +1h)
+  procedures_dt[, proc_timing := fifelse(
+    procedure_billed_dttm > t0_dttm + 3600, 0L,
+    fifelse(procedure_billed_dttm < t0_dttm - 24*3600, 1L, 2L)
+  )]
+  
+  ## Summarize per encounter (max timing = closest to window) ------------------
+  
+  proc_summary = procedures_dt[, .(
+    major_procedure = max(proc_timing, na.rm = TRUE)
+  ), by = joined_hosp_id]
+  
+  proc_summary[major_procedure == -Inf, major_procedure := NA_integer_]
+  
+  cohort = join(cohort, proc_summary, how = "left", multiple = FALSE)
+  cohort[is.na(major_procedure), major_procedure := 0L]
+  
+  message(sprintf("    Major procedure in window: %d (%.1f%%)", 
+                  sum(cohort$major_procedure == 2, na.rm = TRUE),
+                  100 * mean(cohort$major_procedure == 2, na.rm = TRUE)))
+  
+  rm(procedure_codes, procedures_dt, proc_summary)
+  gc()
+  
+} else {
+  message("    ⚠️  Procedure classification file not found: config/PClassR_v2026-1.csv")
+  cohort$major_procedure = 0L
+}
+
+## Convert to binary (1 = procedure in window, 0 = none or outside window) -----
+
+cohort = ftransform(cohort,
+                    major_procedure_01 = fifelse(major_procedure == 2L, 1L, 0L)
+)
+
+# ==============================================================================
+# STEP 10: Derived variables
 # ==============================================================================
 
 message("  Creating derived variables...")
@@ -516,6 +633,40 @@ message(sprintf("    Hispanic: %d of %d known (%.1f%%)",
                 sum(cohort$hispanic_01 == 1, na.rm = TRUE),
                 sum(!is.na(cohort$hispanic_01)),
                 100 * mean(cohort$hispanic_01, na.rm = TRUE)))
+
+## collapsed language: english vs non-english ----------------------------------
+## Unknown/NA → NA, English → 1, Non-English → 0
+
+cohort = ftransform(cohort,
+                    english_01 = fifelse(
+                      is.na(language_category) | tolower(language_category) == "unknown",
+                      NA_integer_,
+                      fifelse(tolower(language_category) == "english", 1L, 0L)
+                    )
+)
+
+message(sprintf("    English: %d of %d known (%.1f%%)", 
+                sum(cohort$english_01 == 1, na.rm = TRUE),
+                sum(!is.na(cohort$english_01)),
+                100 * mean(cohort$english_01, na.rm = TRUE)))
+
+## peak COVID period (March 2020 - February 2022) ------------------------------
+
+covid_start = as.POSIXct("2020-03-01 00:00:00", tz = "UTC")
+covid_end   = as.POSIXct("2022-02-28 23:59:59", tz = "UTC")
+
+cohort = ftransform(cohort,
+                    peak_covid_01 = fifelse(
+                      !is.na(t0_dttm) & t0_dttm >= covid_start & t0_dttm <= covid_end,
+                      1L, 0L
+                    )
+)
+
+message(sprintf("    Peak COVID: %d (%.1f%%)", 
+                sum(cohort$peak_covid_01 == 1, na.rm = TRUE),
+                100 * mean(cohort$peak_covid_01, na.rm = TRUE)))
+
+rm(covid_start, covid_end)
 
 ## LOS to T0 -------------------------------------------------------------------
 
