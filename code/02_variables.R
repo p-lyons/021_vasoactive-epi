@@ -106,8 +106,9 @@ if ("medication_admin_intermittent" %in% names(data_list)) {
       join(date_frame, how = "inner", multiple = TRUE) |>
       fsubset(admin_dttm > t0_dttm & admin_dttm <= endpoint_dttm) |>
       fsubset(!is.na(med_dose) & med_dose > 0) |>
-      fgroup_by(joined_hosp_id) |>
-      fsummarize(mb_01 = 1L)
+      fselect(joined_hosp_id) |>
+      funique() |>
+      ftransform(mb_01 = 1L)
     
     cohort = join(cohort, mb, how = "left", multiple = FALSE)
     rm(mb)
@@ -136,8 +137,9 @@ if ("medication_admin_intermittent" %in% names(data_list)) {
       join(date_frame, how = "inner", multiple = TRUE) |>
       fsubset(admin_dttm > t0_dttm & admin_dttm <= endpoint_dttm) |>
       fsubset(!is.na(med_dose) & med_dose > 0) |>
-      fgroup_by(joined_hosp_id) |>
-      fsummarize(b12_01 = 1L)
+      fselect(joined_hosp_id) |>
+      funique() |>
+      ftransform(b12_01 = 1L)
     
     cohort = join(cohort, b12, how = "left", multiple = FALSE)
     rm(b12)
