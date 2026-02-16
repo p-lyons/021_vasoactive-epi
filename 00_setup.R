@@ -432,7 +432,8 @@ validation_specs = list(
 
 validate_all_tables(data_list, validation_specs)
 
-rm(patient_spec, hosp_spec, adt_spec, dx_spec, med_spec, resp_spec, validation_specs)
+rm(patient_spec, hosp_spec, adt_spec, dx_spec, med_spec_c, med_spec_i, resp_spec, 
+   code_spec, crrt_spec, proc_spec, validation_specs)
 gc()
 
 message("\n✅ 00_setup.R complete. Proceed to 01_cohort.R")
