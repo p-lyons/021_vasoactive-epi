@@ -1,7 +1,18 @@
 # ==============================================================================
 # 03_table.R
-# Vasopressor Escalation in Septic Shock - CLIF Consortium
+# Vasopressor Escalation in Refractory Distributive Shock - CLIF Consortium
 # Generate poolable summary statistics for Table 1
+# Stratified by hospital (column `hospital`) within site.
+#   - Hospital = hospital_id_t0 from 02_variables.R (hospital at T0); switch
+#     hosp_var below to "hospital_id" to use first-ADT hospital instead.
+#   - Every table1/flow output also carries hospital = "site_total" rows
+#     (whole-site summary). Exclude site_total rows when summing across
+#     hospitals.
+# Small-cell policy: counts 1-4 are masked (NA) only for sensitive demographic
+#   variables (sex, race, ethnicity, language). All other counts are not PHI
+#   and are left unmasked. Files are pooled at the coordinating site under the
+#   consortium DUA before anything is shared.
+# Dates: per-hospital study_start / study_end are reported as year-month.
 # ==============================================================================
 
 # Requires: cohort from 02_variables.R
@@ -19,6 +30,40 @@ message(sprintf("\n== Generating Table 1 for site: %s ==", site_lowercase))
 message(sprintf("  Cohort size: %d encounters", nrow(cohort)))
 
 cohort_dt = as.data.table(cohort)
+
+# hospital stratum -------------------------------------------------------------
+
+hosp_var = "hospital_id_t0"
+
+if (!hosp_var %in% names(cohort_dt)) {
+  stop(sprintf("'%s' not found in cohort. Re-run 02_variables.R.", hosp_var), call. = FALSE)
+}
+
+cohort_dt[, hospital := as.character(get(hosp_var))]
+cohort_dt[is.na(hospital), hospital := "unknown"]
+
+message(sprintf("  Hospitals: %d", uniqueN(cohort_dt$hospital)))
+print(cohort_dt[, .N, by = hospital][order(hospital)])
+
+# site-level copy for site_total rows (see header)
+cohort_site_dt = copy(cohort_dt)[, hospital := "site_total"]
+cohort_both_dt = rbindlist(list(cohort_dt, cohort_site_dt), use.names = TRUE)   # hospital rows + site_total rows
+
+# sensitive variables for small-cell masking (see header) ----------------------
+
+sensitive_binary = c(
+  "female_01",
+  "white_01",
+  "hispanic_01",
+  "english_01"
+)
+
+sensitive_categorical = c(
+  "race_category",
+  "ethnicity_category"
+)
+
+mask_threshold = 5L
 
 # ==============================================================================
 # CONTINUOUS VARIABLES - poolable stats
@@ -41,7 +86,7 @@ cont_vars = c(
 )
 
 # function: poolable stats for continuous variable
-summarize_continuous = function(df, var, group_var = "outcome_group") {
+summarize_continuous = function(df, var, group_var = "outcome_group", strata = "hospital") {
   df[!is.na(get(group_var)) & get(group_var) != "other", .(
     variable  = var,
     n         = sum(!is.na(get(var))),
@@ -55,12 +100,15 @@ summarize_continuous = function(df, var, group_var = "outcome_group") {
     p50       = quantile(get(var), 0.50, na.rm = TRUE),
     p75       = quantile(get(var), 0.75, na.rm = TRUE),
     p975      = quantile(get(var), 0.975, na.rm = TRUE)
-  ), by = group_var]
+  ), by = c(strata, group_var)]
 }
 
 t1_continuous = lapply(cont_vars, function(v) {
   if (v %in% names(cohort_dt)) {
-    summarize_continuous(cohort_dt, v)
+    rbindlist(list(
+      summarize_continuous(cohort_dt, v),
+      summarize_continuous(cohort_site_dt, v)
+    ), use.names = TRUE)
   } else {
     message(sprintf("    ⚠️  Variable '%s' not found", v))
     NULL
@@ -104,17 +152,17 @@ binary_vars = c(
 )
 
 # function: summarize binary variable (n and n with value=1)
-summarize_binary = function(df, var, group_var = "outcome_group") {
+summarize_binary = function(df, var, group_var = "outcome_group", strata = "hospital") {
   df[!is.na(get(group_var)) & get(group_var) != "other", .(
     variable = var,
     n        = sum(!is.na(get(var))),
     n_1      = sum(get(var) == 1, na.rm = TRUE)
-  ), by = group_var]
+  ), by = c(strata, group_var)]
 }
 
 t1_binary = lapply(binary_vars, function(v) {
   if (v %in% names(cohort_dt)) {
-    summarize_binary(cohort_dt, v)
+    summarize_binary(cohort_both_dt, v)
   } else {
     message(sprintf("    ⚠️  Binary variable '%s' not found", v))
     NULL
@@ -138,18 +186,18 @@ cat_vars = c(
 )
 
 # function: cell counts for categorical variable
-summarize_categorical = function(df, var, group_var = "outcome_group") {
-  result = df[!is.na(get(group_var)) & get(group_var) != "other", .N, by = c(group_var, var)]
+summarize_categorical = function(df, var, group_var = "outcome_group", strata = "hospital") {
+  result = df[!is.na(get(group_var)) & get(group_var) != "other", .N, by = c(strata, group_var, var)]
   result[, variable := var]
   setnames(result, var, "category")
   result[, category := as.character(category)]
   setnames(result, "N", "n")
-  result[, .(outcome_group, variable, category, n)]
+  result[, .(hospital, outcome_group, variable, category, n)]
 }
 
 t1_categorical = lapply(cat_vars, function(v) {
   if (v %in% names(cohort_dt)) {
-    summarize_categorical(cohort_dt, v)
+    summarize_categorical(cohort_both_dt, v)
   } else {
     message(sprintf("    ⚠️  Categorical variable '%s' not found", v))
     NULL
@@ -164,19 +212,19 @@ t1_categorical$site = site_lowercase
 
 timing_vars = c("imv_timing_group", "crrt_timing_group")
 
-summarize_timing = function(df, var, group_var = "outcome_group") {
+summarize_timing = function(df, var, group_var = "outcome_group", strata = "hospital") {
   df[!is.na(get(group_var)) & get(group_var) != "other", .(
     variable = var,
     n        = sum(!is.na(get(var))),
     n_0      = sum(get(var) == 0, na.rm = TRUE),
     n_1      = sum(get(var) == 1, na.rm = TRUE),
     n_2      = sum(get(var) == 2, na.rm = TRUE)
-  ), by = group_var]
+  ), by = c(strata, group_var)]
 }
 
 t1_timing = lapply(timing_vars, function(v) {
   if (v %in% names(cohort_dt)) {
-    summarize_timing(cohort_dt, v)
+    summarize_timing(cohort_both_dt, v)
   } else {
     message(sprintf("    ⚠️  Timing variable '%s' not found", v))
     NULL
@@ -193,13 +241,14 @@ t1_timing$site = site_lowercase
 
 message("  Computing group totals...")
 
-message(sprintf("  outcome_group values: %s", 
+message(sprintf("  outcome_group values: %s",
                 paste(unique(cohort_dt$outcome_group), collapse = ", ")))
 
-t1_totals = cohort_dt[!is.na(outcome_group) & outcome_group != "other", .(
+t1_totals = cohort_both_dt[!is.na(outcome_group)
+                          & outcome_group != "other", .(
   n_total    = .N,
   n_patients = uniqueN(patient_id)
-), by = outcome_group]
+), by = .(hospital, outcome_group)]
 
 t1_totals$site = site_lowercase
 
@@ -209,24 +258,30 @@ t1_totals$site = site_lowercase
 
 message("\n  Quality control...")
 
-## mask small cells (n < 5) ----------------------------------------------------
+## mask small cells for sensitive demographic variables only -------------------
 
-mask_small = function(dt, n_col = "n", threshold = 5) {
-  dt = copy(dt)
-  dt[get(n_col) > 0 & get(n_col) < threshold, (n_col) := NA_integer_]
-  dt
-}
+n_small_binary = t1_binary[
+  variable %chin% sensitive_binary & n_1 > 0 & n_1 < mask_threshold,
+  .N
+]
 
-n_small_binary = sum(t1_binary$n_1 > 0 & t1_binary$n_1 < 5, na.rm = TRUE)
-n_small_cat    = sum(t1_categorical$n > 0 & t1_categorical$n < 5, na.rm = TRUE)
+n_small_cat = t1_categorical[
+  variable %chin% sensitive_categorical & n > 0 & n < mask_threshold,
+  .N
+]
 
-if (n_small_binary > 0 || n_small_cat > 0) {
-  message(sprintf("  ⚠️  Masking %d small cells in binary, %d in categorical (n < 5)", 
-                  n_small_binary, n_small_cat))
-  
-  t1_binary      = mask_small(t1_binary, "n_1")
-  t1_categorical = mask_small(t1_categorical, "n")
-}
+message(sprintf("  Masking %d sensitive binary cells and %d sensitive categorical cells (n < %d)",
+                n_small_binary, n_small_cat, mask_threshold))
+
+t1_binary[
+  variable %chin% sensitive_binary & n_1 > 0 & n_1 < mask_threshold,
+  n_1 := NA_integer_
+]
+
+t1_categorical[
+  variable %chin% sensitive_categorical & n > 0 & n < mask_threshold,
+  n := NA_integer_
+]
 
 ## verify totals ---------------------------------------------------------------
 
@@ -234,7 +289,7 @@ if (nrow(t1_totals) == 0) {
   stop("t1_totals is empty - check outcome_group", call. = FALSE)
 }
 
-total_from_groups = sum(t1_totals$n_total)
+total_from_groups = sum(t1_totals[hospital != "site_total"]$n_total)
 message(sprintf("  Total across groups: %d", total_from_groups))
 
 # ==============================================================================
@@ -243,23 +298,27 @@ message(sprintf("  Total across groups: %d", total_from_groups))
 
 message("  Creating flow diagram...")
 
-flow_diagram = data.table(
-  step = c(
-    "Total encounters meeting T0 criteria",
-    "No escalation + dead/hospice",
-    "Escalated + dead/hospice",
-    "Escalated + alive",
-    "No escalation + alive"
-  ),
-  n = c(
-    nrow(cohort_dt[outcome_group != "other"]),
-    sum(cohort_dt$outcome_group == "noesc_dead", na.rm = TRUE),
-    sum(cohort_dt$outcome_group == "esc_dead", na.rm = TRUE),
-    sum(cohort_dt$outcome_group == "esc_alive", na.rm = TRUE),
-    sum(cohort_dt$outcome_group == "noesc_alive", na.rm = TRUE)
-  ),
-  site = site_lowercase
+# one block of 5 rows per hospital + site_total
+flow_steps = c(
+  "Total encounters meeting T0 criteria",
+  "No escalation + dead/hospice",
+  "Escalated + dead/hospice",
+  "Escalated + alive",
+  "No escalation + alive"
 )
+
+flow_diagram = cohort_both_dt[, .(
+  step = flow_steps,
+  n    = c(
+    sum(outcome_group != "other", na.rm = TRUE),
+    sum(outcome_group == "noesc_dead", na.rm = TRUE),
+    sum(outcome_group == "esc_dead", na.rm = TRUE),
+    sum(outcome_group == "esc_alive", na.rm = TRUE),
+    sum(outcome_group == "noesc_alive", na.rm = TRUE)
+  )
+), by = hospital]
+
+flow_diagram$site = site_lowercase
 
 # ==============================================================================
 # QC DIAGNOSTICS
@@ -271,25 +330,33 @@ message("  Creating QC diagnostics...")
 
 all_vars = c(
   "age", "female_01", "race_category", "ethnicity_category", "vw",
-  "code_status_t0", "los_to_t0_d", "icu_los_to_t0_d", 
+  "code_status_t0", "los_to_t0_d", "icu_los_to_t0_d",
   "ne_dose_t0", "vp_dose_t0", "max_ne_equiv_48h",
   "svi_percentile", "adi_percentile", "los_hosp_d",
   "imv_dttm", "crrt_dttm", "census_block_code"
 )
 
-qc_missing = data.table(
-  variable = all_vars,
-  n_total  = nrow(cohort_dt),
-  n_miss   = sapply(all_vars, function(v) {
-    if (v %in% names(cohort_dt)) sum(is.na(cohort_dt[[v]])) else NA_integer_
-  }),
-  site = site_lowercase
-)
+fn_qc_missing = function(dt, hosp_label) {
+  data.table(
+    hospital = hosp_label,
+    variable = all_vars,
+    n_total  = nrow(dt),
+    n_miss   = sapply(all_vars, function(v) {
+      if (v %in% names(dt)) sum(is.na(dt[[v]])) else NA_integer_
+    }),
+    site = site_lowercase
+  )
+}
+
+qc_missing = rbindlist(c(
+  lapply(sort(unique(cohort_dt$hospital)), function(h) fn_qc_missing(cohort_dt[hospital == h], h)),
+  list(fn_qc_missing(cohort_dt, "site_total"))
+))
 qc_missing[, pct_miss := round(n_miss / n_total * 100, 1)]
 
 ## continuous variable ranges --------------------------------------------------
 
-cont_vars_qc = c("age", "vw", "los_to_t0_d", "icu_los_to_t0_d", 
+cont_vars_qc = c("age", "vw", "los_to_t0_d", "icu_los_to_t0_d",
                  "ne_dose_t0", "vp_dose_t0", "max_ne_equiv_48h",
                  "svi_percentile", "adi_percentile", "los_hosp_d")
 
@@ -338,74 +405,97 @@ qc_flags = data.table(
 
 ## categorical value inventory -------------------------------------------------
 
-cat_vars_qc = c("race_category", "ethnicity_category", "code_status_t0", 
+cat_vars_qc = c("race_category", "ethnicity_category", "code_status_t0",
                 "discharge_category", "outcome_group")
 
 qc_categories = rbindlist(lapply(cat_vars_qc, function(v) {
   if (v %in% names(cohort_dt)) {
     cohort_dt[, .(n = .N), by = c(v)][, .(
       variable = v,
-      category = get(v),
+      category = as.character(get(v)),
       n        = n,
       site     = site_lowercase
     )]
   }
 }), fill = TRUE)
 
+# same sensitive-variable masking as Table 1
+qc_categories[
+  variable %chin% sensitive_categorical & n > 0 & n < mask_threshold,
+  n := NA_integer_
+]
+
 ## site diagnostics summary ----------------------------------------------------
 
-# Key metrics for cross-site validation
-qc_diagnostics = data.table(
-  metric = c(
-    "n_encounters",
-    "n_patients",
-    "study_start",
-    "study_end",
-    "pct_female",
-    "median_age",
-    "pct_white",
-    "pct_hispanic",
-    "pct_english",
-    "pct_academic",
-    "pct_peak_covid",
-    "pct_dead_hospice",
-    "pct_escalated",
-    "pct_svi_linked",
-    "pct_adi_linked",
-    "pct_code_documented",
-    "pct_major_procedure",
-    "median_ne_dose_t0",
-    "median_vp_dose_t0",
-    "median_los_to_t0_h",
-    "pct_imv_at_t0",
-    "pct_crrt"
-  ),
-  value = c(
-    nrow(cohort_dt),
-    uniqueN(cohort_dt$patient_id),
-    as.character(min(cohort_dt$t0_dttm, na.rm = TRUE)),
-    as.character(max(cohort_dt$t0_dttm, na.rm = TRUE)),
-    round(mean(cohort_dt$female_01, na.rm = TRUE) * 100, 1),
-    round(median(cohort_dt$age, na.rm = TRUE), 1),
-    round(mean(cohort_dt$white_01, na.rm = TRUE) * 100, 1),
-    round(mean(cohort_dt$hispanic_01, na.rm = TRUE) * 100, 1),
-    round(mean(cohort_dt$english_01, na.rm = TRUE) * 100, 1),
-    round(mean(cohort_dt$academic_01, na.rm = TRUE) * 100, 1),
-    round(mean(cohort_dt$peak_covid_01, na.rm = TRUE) * 100, 1),
-    round(mean(cohort_dt$outcome_group %in% c("noesc_dead", "esc_dead"), na.rm = TRUE) * 100, 1),
-    round(mean(cohort_dt$outcome_group %in% c("esc_dead", "esc_alive"), na.rm = TRUE) * 100, 1),
-    round(mean(!is.na(cohort_dt$svi_percentile)) * 100, 1),
-    round(mean(!is.na(cohort_dt$adi_percentile)) * 100, 1),
-    round(mean(cohort_dt$code_documented_01, na.rm = TRUE) * 100, 1),
-    round(mean(cohort_dt$major_procedure_01, na.rm = TRUE) * 100, 1),
-    round(median(cohort_dt$ne_dose_t0, na.rm = TRUE), 3),
-    round(median(cohort_dt$vp_dose_t0, na.rm = TRUE), 4),
-    round(median(cohort_dt$los_to_t0_d, na.rm = TRUE) * 24, 1),
-    round(mean(cohort_dt$imv_at_t0_01, na.rm = TRUE) * 100, 1),
-    round(mean(cohort_dt$crrt_01, na.rm = TRUE) * 100, 1)
-  ),
-  site = site_lowercase
-)
+# Key metrics for cross-site validation; run per hospital + site_total
+fn_qc_diagnostics = function(dt, hosp_label) {
+  data.table(
+    hospital = hosp_label,
+    metric = c(
+      "n_encounters",
+      "n_patients",
+      "study_start_ym",
+      "study_end_ym",
+      "pct_female",
+      "median_age",
+      "pct_white",
+      "pct_hispanic",
+      "pct_english",
+      "pct_academic",
+      "pct_peak_covid",
+      "pct_dead_hospice",
+      "pct_escalated",
+      "pct_svi_linked",
+      "pct_adi_linked",
+      "pct_code_documented",
+      "pct_major_procedure",
+      "median_ne_dose_t0",
+      "median_vp_dose_t0",
+      "median_los_to_t0_h",
+      "pct_imv_at_t0",
+      "pct_crrt"
+    ),
+    value = c(
+      nrow(dt),
+      uniqueN(dt$patient_id),
+      format(min(dt$t0_dttm, na.rm = TRUE), "%Y-%m"),
+      format(max(dt$t0_dttm, na.rm = TRUE), "%Y-%m"),
+      round(mean(dt$female_01, na.rm = TRUE) * 100, 1),
+      round(median(dt$age, na.rm = TRUE), 1),
+      round(mean(dt$white_01, na.rm = TRUE) * 100, 1),
+      round(mean(dt$hispanic_01, na.rm = TRUE) * 100, 1),
+      round(mean(dt$english_01, na.rm = TRUE) * 100, 1),
+      round(mean(dt$academic_01, na.rm = TRUE) * 100, 1),
+      round(mean(dt$peak_covid_01, na.rm = TRUE) * 100, 1),
+      round(mean(dt$outcome_group %in% c("noesc_dead", "esc_dead"), na.rm = TRUE) * 100, 1),
+      round(mean(dt$outcome_group %in% c("esc_dead", "esc_alive"), na.rm = TRUE) * 100, 1),
+      round(mean(!is.na(dt$svi_percentile)) * 100, 1),
+      round(mean(!is.na(dt$adi_percentile)) * 100, 1),
+      round(mean(dt$code_documented_01, na.rm = TRUE) * 100, 1),
+      round(mean(dt$major_procedure_01, na.rm = TRUE) * 100, 1),
+      round(median(dt$ne_dose_t0, na.rm = TRUE), 3),
+      round(median(dt$vp_dose_t0, na.rm = TRUE), 4),
+      round(median(dt$los_to_t0_d, na.rm = TRUE) * 24, 1),
+      round(mean(dt$imv_at_t0_01, na.rm = TRUE) * 100, 1),
+      round(mean(dt$crrt_01, na.rm = TRUE) * 100, 1)
+    ),
+    site = site_lowercase
+  )
+}
+
+qc_diagnostics = rbindlist(c(
+  lapply(sort(unique(cohort_dt$hospital)), function(h) fn_qc_diagnostics(cohort_dt[hospital == h], h)),
+  list(fn_qc_diagnostics(cohort_dt, "site_total"))
+))
+
+## hospital attribution --------------------------------------------------------
+
+qc_hospital = cohort_dt[, .(
+  n_encounters         = .N,
+  n_first_hosp_differs = sum(as.character(hospital_id) != hospital, na.rm = TRUE),
+  pct_academic         = round(mean(academic_01, na.rm = TRUE) * 100, 1)
+), by = hospital][order(hospital)]
+qc_hospital$site = site_lowercase
 
 # ==============================================================================
 # SAVE OUTPUTS
@@ -429,8 +519,10 @@ fwrite(qc_ranges,      file.path(output_dir, sprintf("qc_ranges_%s.csv",      si
 fwrite(qc_flags,       file.path(output_dir, sprintf("qc_flags_%s.csv",       site_lowercase)))
 fwrite(qc_categories,  file.path(output_dir, sprintf("qc_categories_%s.csv",  site_lowercase)))
 fwrite(qc_diagnostics, file.path(output_dir, sprintf("qc_diagnostics_%s.csv", site_lowercase)))
+fwrite(qc_hospital,    file.path(output_dir, sprintf("qc_hospital_%s.csv",    site_lowercase)))
 
 message(sprintf("  ✅ Saved to: %s", output_dir))
+message("    - all table1/flow files stratified by hospital (column: hospital)")
 message("    - table1_continuous_*.csv  (n, sum, sumsq, percentiles by group)")
 message("    - table1_binary_*.csv      (n, n_1 by group)")
 message("    - table1_categorical_*.csv (cell counts by group)")

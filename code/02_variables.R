@@ -1,10 +1,13 @@
 # ==============================================================================
 # 02_variables.R
-# Vasopressor Escalation in Septic Shock - CLIF Consortium
-# Define: 48h window, escalation, timing groups, SVI/ADI, outcome groups
+# Vasopressor Escalation in Refractory Distributive Shock - CLIF Consortium
+# Define: 48h window, escalation, timing groups, SVI/ADI, hospital at T0,
+#   outcome groups
 # ==============================================================================
 
-# Requires: cohort, vasoactive_doses, data_list from 01_cohort.R
+# Requires: cohort, data_list, hid_jid_crosswalk from 01_cohort.R
+# vasoactive_doses.parquet: one row per MAR timestamp; each *_dose column is
+#   the active dose (4h carry-forward) or NA when the agent is not active.
 
 if (!exists("cohort")) {
   cohort            = read_parquet(here("proj_tables", "cohort.parquet"))
@@ -47,7 +50,7 @@ message("  Loading vasoactive doses...")
 va = read_parquet(here("proj_tables", "vasoactive_doses.parquet"))
 setDT(va)
 
-## escalation = epi, phenyl, dopa, or a2 after T0 within 48h -------------------
+## escalation = epi, phenyl, dopa, or a2 active after T0 within 48h ------------
 
 message("  Identifying escalation events (continuous drugs)...")
 
@@ -106,9 +109,8 @@ if ("medication_admin_intermittent" %in% names(data_list)) {
       join(date_frame, how = "inner", multiple = TRUE) |>
       fsubset(admin_dttm > t0_dttm & admin_dttm <= endpoint_dttm) |>
       fsubset(!is.na(med_dose) & med_dose > 0) |>
-      fselect(joined_hosp_id) |>
-      funique() |>
-      ftransform(mb_01 = 1L)
+      fgroup_by(joined_hosp_id) |>
+      fsummarize(mb_01 = 1L)
     
     cohort = join(cohort, mb, how = "left", multiple = FALSE)
     rm(mb)
@@ -137,9 +139,8 @@ if ("medication_admin_intermittent" %in% names(data_list)) {
       join(date_frame, how = "inner", multiple = TRUE) |>
       fsubset(admin_dttm > t0_dttm & admin_dttm <= endpoint_dttm) |>
       fsubset(!is.na(med_dose) & med_dose > 0) |>
-      fselect(joined_hosp_id) |>
-      funique() |>
-      ftransform(b12_01 = 1L)
+      fgroup_by(joined_hosp_id) |>
+      fsummarize(b12_01 = 1L)
     
     cohort = join(cohort, b12, how = "left", multiple = FALSE)
     rm(b12)
@@ -365,7 +366,7 @@ code_status =
   fsubset(start_dttm >= admission_dttm & start_dttm <= t0_dttm) |>
   ftransform(code_status_category = tolower(code_status_category))
 
-## Step 1: Initial code status = LAST code status in hours 0-12 ----------------
+## initial code status = LAST code status in hours 0-12 ------------------------
 ## (avoids placeholder orders that quickly get changed)
 
 initial_window = 
@@ -377,7 +378,7 @@ initial_window =
   fgroup_by(joined_hosp_id) |>
   fsummarize(initial_code_status = flast(code_status_category))
 
-## Step 2: Most recent code status at T0 (LOCF) --------------------------------
+## most recent code status at T0 (LOCF) ----------------------------------------
 
 code_at_t0 = 
   code_status |>
@@ -386,8 +387,8 @@ code_at_t0 =
   fgroup_by(joined_hosp_id) |>
   fsummarize(code_status_t0 = flast(code_status_category))
 
-## Step 3: Combine -------------------------------------------------------------
-## Use code_status_t0 if available, else initial_code_status, else presume_full
+## combine ---------------------------------------------------------------------
+## use code_status_t0 if available, else initial_code_status, else presume full
 
 cohort = join(cohort, initial_window, how = "left", multiple = FALSE)
 cohort = join(cohort, code_at_t0, how = "left", multiple = FALSE)
@@ -432,94 +433,131 @@ gc()
 
 message("  Adding SVI/ADI...")
 
-## SVI (Social Vulnerability Index) --------------------------------------------
+## check if census_block_code has usable FIPS data ----------------------------
 
-svi_file = here("config", "svi_2020.parquet")
+has_fips = "census_block_code" %in% names(cohort) &&
+  !all(is.na(cohort$census_block_code)) &&
+  any(nchar(trimws(as.character(cohort$census_block_code))) >= 11, na.rm = TRUE)
 
-if (file.exists(svi_file)) {
-  svi_list = read_parquet(svi_file)
-  
-  # extract census tract from census_block_code (first 11 digits)
-  cohort = ftransform(cohort,
-                      census_tract = substr(census_block_code, 1, 11)
-  )
-  
-  cohort = join(cohort, svi_list, on = "census_tract", how = "left", multiple = FALSE)
-  
-  message(sprintf("    SVI linked: %d of %d encounters (%.1f%%)",
-                  sum(!is.na(cohort$svi_percentile)),
-                  nrow(cohort),
-                  100 * mean(!is.na(cohort$svi_percentile))))
+if (!has_fips) {
+  message("    ⚠️  No usable FIPS/census_block_code data — SVI/ADI columns set to NA")
+  cohort$census_tract          = NA_character_
+  cohort$svi_percentile        = NA_real_
+  cohort$adi_percentile        = NA_real_
 } else {
-  message("    ⚠️  SVI file not found: config/svi_2020.parquet")
-  cohort$svi_percentile = NA_real_
-}
 
-## ADI (Area Deprivation Index) ------------------------------------------------
-
-adi_file = here("config", "adi_2020.parquet")
-
-if (file.exists(adi_file)) {
-  adi_list = read_parquet(adi_file)
+  ## SVI (Social Vulnerability Index) ------------------------------------------
   
-  # extract census block group from census_block_code (first 12 digits)
-  # only if not already present
-  if (!"census_block_group_code" %in% names(cohort) || all(is.na(cohort$census_block_group_code))) {
+  svi_file = here("config", "svi_2020.parquet")
+  
+  if (file.exists(svi_file)) {
+    svi_list = read_parquet(svi_file)
+    
+    # extract census tract from census_block_code (first 11 digits)
     cohort = ftransform(cohort,
-                        census_block_group_code = substr(census_block_code, 1, 12)
+                        census_tract = substr(census_block_code, 1, 11)
     )
+    
+    cohort = join(cohort, svi_list, on = "census_tract", how = "left", multiple = FALSE)
+    
+    message(sprintf("    SVI linked: %d of %d encounters (%.1f%%)",
+                    sum(!is.na(cohort$svi_percentile)),
+                    nrow(cohort),
+                    100 * mean(!is.na(cohort$svi_percentile))))
+  } else {
+    message("    ⚠️  SVI file not found: config/svi_2020.parquet")
+    cohort$svi_percentile = NA_real_
   }
   
-  cohort = join(cohort, adi_list, on = "census_block_group_code", how = "left", multiple = FALSE)
+  ## ADI (Area Deprivation Index) ----------------------------------------------
   
-  message(sprintf("    ADI linked: %d of %d encounters (%.1f%%)",
-                  sum(!is.na(cohort$adi_percentile)),
-                  nrow(cohort),
-                  100 * mean(!is.na(cohort$adi_percentile))))
-} else {
-  message("    ⚠️  ADI file not found: config/adi_2020.parquet")
-  cohort$adi_percentile = NA_real_
-}
+  adi_file = here("config", "adi_2020.parquet")
+  
+  if (file.exists(adi_file)) {
+    adi_list = read_parquet(adi_file)
+    
+    # extract census block group from census_block_code (first 12 digits)
+    # only if not already present
+    if (!"census_block_group_code" %in% names(cohort) || all(is.na(cohort$census_block_group_code))) {
+      cohort = ftransform(cohort,
+                          census_block_group_code = substr(census_block_code, 1, 12)
+      )
+    }
+    
+    cohort = join(cohort, adi_list, on = "census_block_group_code", how = "left", multiple = FALSE)
+    
+    message(sprintf("    ADI linked: %d of %d encounters (%.1f%%)",
+                    sum(!is.na(cohort$adi_percentile)),
+                    nrow(cohort),
+                    100 * mean(!is.na(cohort$adi_percentile))))
+  } else {
+    message("    ⚠️  ADI file not found: config/adi_2020.parquet")
+    cohort$adi_percentile = NA_real_
+  }
+  
+} # end has_fips
 
 # ==============================================================================
-# STEP 8: Academic vs Community Hospital
+# STEP 8: Hospital at T0 and hospital type at T0
 # ==============================================================================
+# hospital_id_t0 / hospital_type_t0 come from one ADT row: the last row with
+# in_dttm <= t0_dttm, else the first ADT row of the joined encounter.
+# academic_01 is derived from hospital_type_t0, so each hospital stratum has a
+# single type. Encounters with no ADT row -> hospital_id_t0 = "unknown".
 
-message("  Adding hospital type...")
-
-## Get hospital_type from ADT (last location before endpoint) ------------------
+message("  Adding hospital and hospital type at T0...")
 
 adt_hosp = 
   dplyr::filter(data_list$adt, hospitalization_id %in% cohort_hids) |>
-  dplyr::select(hospitalization_id, in_dttm, hospital_type) |>
+  dplyr::select(hospitalization_id, in_dttm, hospital_id, hospital_type) |>
   dplyr::collect() |>
   as.data.table()
 
 adt_hosp = join(adt_hosp, hid_jid_crosswalk, how = "inner", multiple = TRUE)
-adt_hosp = join(adt_hosp, fselect(cohort, joined_hosp_id, endpoint_dttm), how = "inner", multiple = TRUE)
+adt_hosp = join(adt_hosp, fselect(cohort, joined_hosp_id, t0_dttm), how = "inner", multiple = TRUE)
+adt_hosp = adt_hosp[!is.na(in_dttm)]
 
 setorder(adt_hosp, joined_hosp_id, in_dttm)
+adt_hosp[, pre_t0 := in_dttm <= t0_dttm]
 
-# Get last hospital_type before endpoint
-last_hosp_type = adt_hosp[
-  !is.na(in_dttm) & !is.na(endpoint_dttm) & in_dttm <= endpoint_dttm,
-  .SD[which.max(in_dttm)],
+hosp_at_t0 = adt_hosp[
+  ,
+  if (any(pre_t0)) .SD[max(which(pre_t0))] else .SD[1L],
   by = joined_hosp_id
-][, .(joined_hosp_id, hospital_type)]
+]
 
-last_hosp_type[, academic_01 := fifelse(
-  tolower(hospital_type) == "academic", 1L,
-  fifelse(tolower(hospital_type) == "community", 0L, NA_integer_)
-)]
+hosp_at_t0 = hosp_at_t0[
+  ,
+  .(
+    joined_hosp_id,
+    hospital_id_t0   = as.character(hospital_id),
+    hospital_type_t0 = tolower(trimws(as.character(hospital_type)))
+  )
+]
 
-cohort = join(cohort, last_hosp_type[, .(joined_hosp_id, academic_01)], how = "left", multiple = FALSE)
+cohort = join(cohort, hosp_at_t0, how = "left", multiple = FALSE)
+
+cohort = ftransform(cohort,
+                    hospital_id    = as.character(hospital_id),
+                    hospital_id_t0 = fifelse(is.na(hospital_id_t0), "unknown", hospital_id_t0),
+                    academic_01    = fifelse(
+                      hospital_type_t0 == "academic", 1L,
+                      fifelse(hospital_type_t0 == "community", 0L, NA_integer_)
+                    )
+)
 
 message(sprintf("    Academic: %d of %d known (%.1f%%)", 
                 sum(cohort$academic_01 == 1, na.rm = TRUE),
                 sum(!is.na(cohort$academic_01)),
                 100 * mean(cohort$academic_01, na.rm = TRUE)))
 
-rm(adt_hosp, last_hosp_type)
+message(sprintf("    Hospitals at T0: %d | first-ADT hospital differs from T0 hospital: %d of %d encounters",
+                length(unique(cohort$hospital_id_t0)),
+                sum(cohort$hospital_id != cohort$hospital_id_t0, na.rm = TRUE),
+                nrow(cohort)))
+print(table(cohort$hospital_id_t0, useNA = "ifany"))
+
+rm(adt_hosp, hosp_at_t0)
 gc()
 
 # ==============================================================================
@@ -725,7 +763,7 @@ cohort = ftransform(cohort,
 )
 
 # ==============================================================================
-# STEP 9: Outcome groups (4 groups - escalation × death/hospice)
+# STEP 11: Outcome groups (4 groups - escalation × death/hospice)
 # ==============================================================================
 
 message("  Finalizing outcome groups...")
@@ -769,7 +807,7 @@ message("\n  Outcome distribution:")
 print(table(cohort$outcome_group, useNA = "ifany"))
 
 # ==============================================================================
-# STEP 10: Save analytic cohort
+# STEP 12: Save analytic cohort
 # ==============================================================================
 
 message("\n== Saving analytic cohort ==")

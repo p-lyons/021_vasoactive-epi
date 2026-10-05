@@ -1,282 +1,219 @@
 # CLIF Vasopressor Escalation Study
 
-## Site-Level Analysis Pipeline
+Vasopressor escalation in refractory distributive shock: a federated, multicenter CLIF cohort.
 
-This pipeline identifies patients with refractory septic shock receiving norepinephrine ≥0.2 mcg/kg/min plus vasopressin, and characterizes outcomes at 48 hours based on vasopressor escalation and mortality.
+This repository holds the site-level pipeline that each CLIF site runs locally, and the coordinating-site scripts that pool the site outputs. No patient-level data leave a site.
 
 ---
 
-## Table of Contents
+## Contents
 
-1. [Overview](#overview)
-2. [Cohort Definition](#cohort-definition)
-3. [Outcome Groups](#outcome-groups)
+1. [Repository layout](#repository-layout)
+2. [Cohort definition](#cohort-definition)
+3. [Outcome groups](#outcome-groups)
 4. [Prerequisites](#prerequisites)
-5. [Setup Instructions](#setup-instructions)
-6. [Running the Pipeline](#running-the-pipeline)
-7. [Output Files](#output-files)
-8. [Script Descriptions](#script-descriptions)
+5. [Setup](#setup)
+6. [Running the pipeline](#running-the-pipeline)
+7. [Output files](#output-files)
+8. [Small-cell policy](#small-cell-policy)
 9. [Variables](#variables)
 10. [Troubleshooting](#troubleshooting)
 
 ---
 
-## Overview
+## Repository layout
 
-This study examines vasopressor escalation patterns in patients with septic shock who are already receiving high-dose norepinephrine plus vasopressin. The pipeline:
-
-- Links contiguous hospitalizations (≤6 hour gaps)
-- Identifies T0: first time with NE ≥0.2 mcg/kg/min AND vasopressin concurrently (no other vasopressors running)
-- Tracks escalation to additional agents within 48 hours
-- Generates poolable summary statistics for multi-site analysis
+```
+code/                          site-level pipeline (run at each site)
+  00_setup.R                   packages, config, CLIF table loading, validation
+  01_cohort.R                  cohort, T0, exclusion cascade, vasoactive doses
+  02_variables.R               escalation, outcomes, hospital at T0, covariates
+  03_table.R                   poolable Table 1 and QC summaries, by hospital
+  run_all.R                    runs 00 -> 03 in order
+  sankey_transitions_onepass.R standalone: state-transition counts for the Sankey figure
+code_for_pooled_data/          coordinating site only: pools site outputs
+config/
+  config_clif_pressors_EXAMPLE.yaml   template for your site config
+  clif_sites.csv               valid site names and time zones
+  svi_2020.parquet             Social Vulnerability Index (optional)
+  adi_2020.parquet             Area Deprivation Index (optional)
+```
 
 ---
 
-## Cohort Definition
+## Cohort definition
 
-**Inclusion criteria:**
-- Age ≥18 years at admission
+**Inclusion criteria**
+
+- Age 18 years or older at admission
 - Admission between 2016-01-01 and 2024-12-31
-- Had ED or ICU stay during hospitalization
-- Received norepinephrine ≥0.2 mcg/kg/min AND vasopressin concurrently
-- At T0, no other vasopressors were running (epinephrine, phenylephrine, dopamine, angiotensin II)
+- ED or ICU stay during the hospitalization
+- Norepinephrine >= 0.2 mcg/kg/min and vasopressin active at the same time, with no other continuous vasopressor active (T0)
 
-**Exclusion criteria:**
-- Psychiatric or rehabilitation unit stay
-- Missing discharge disposition
+**Exclusion criteria** (in cascade order, as written to `exclusion_cascade_{site}.csv`)
 
-**T0 definition:**
-First timepoint where:
-- Norepinephrine dose ≥0.2 mcg/kg/min (carry-forward)
-- Vasopressin is running (any dose, carry-forward)
-- No epinephrine, phenylephrine, dopamine, or angiotensin II running
+| Step | Excludes |
+|------|----------|
+| `02_required_ed_or_icu` | No ED or ICU stay |
+| `03_excluded_psych_rehab` | Psychiatric or rehabilitation unit stay |
+| `04_missing_discharge_category` | Missing discharge disposition |
+| `04b_yodo_cleanup` | Duplicate death records and encounters after death |
+| `05_uninterpretable_mar` | No usable (finite, > 0) norepinephrine or vasopressin dose |
+| `06_met_t0_criteria` | Never met T0 criteria |
+| `07_third_line_prior_to_t0` | Any other continuous vasopressor active before T0 |
+
+Hospitalizations with gaps of less than 6 hours are linked into one encounter.
+
+**Dose activity rule.** A continuous dose is active only if it is > 0, it is not a "stopped" action, and it was charted within the previous 4 hours (carry-forward window). Doses are converted to mcg/kg/min (catecholamines), units/min (vasopressin), and ng/kg/min (angiotensin II). The first in-encounter weight is used; 70 kg if none is charted.
+
+**T0** is the first MAR timestamp at which norepinephrine >= 0.2 mcg/kg/min and vasopressin are active, and epinephrine, phenylephrine, dopamine, and angiotensin II are not.
+
+The cohort logic in `01_cohort.R` and `sankey_transitions_onepass.R` must stay identical. Change both together.
 
 ---
 
-## Outcome Groups
+## Outcome groups
 
-Patients are classified into 4 mutually exclusive groups based on status at 48 hours post-T0:
+Each encounter is classified at 48 hours after T0:
 
 | Group | Label | Definition |
 |-------|-------|------------|
-| 0 | No Esc + Dead/Hospice | No escalation, died or discharged to hospice within 48h |
-| 1 | Esc + Dead/Hospice | Escalated, died or discharged to hospice within 48h |
-| 2 | Esc + Alive | Escalated, alive at 48h |
-| 3 | No Esc + Alive | No escalation, alive at 48h |
+| `noesc_dead` | No escalation + dead/hospice | No escalation; died or discharged to hospice within 48 h |
+| `esc_dead` | Escalation + dead/hospice | Escalated; died or discharged to hospice within 48 h |
+| `esc_alive` | Escalation + alive | Escalated; alive and not in hospice at 48 h |
+| `noesc_alive` | No escalation + alive | No escalation; alive and not in hospice at 48 h |
 
-**Escalation** is defined as receipt of any of the following after T0 and within 48 hours:
-- Epinephrine (continuous infusion)
-- Phenylephrine (continuous infusion)
-- Dopamine (continuous infusion)
-- Angiotensin II (continuous infusion)
-- Methylene blue (intermittent)
-- Hydroxocobalamin (intermittent)
+**Escalation** is any of the following after T0 and within 48 hours:
+
+- Continuous epinephrine, phenylephrine, dopamine, or angiotensin II (active dose)
+- Intermittent methylene blue or hydroxocobalamin
 
 ---
 
 ## Prerequisites
 
-### Required CLIF Tables
+### Required CLIF tables
 
-Your site must have the following CLIF tables in parquet, CSV, or FST format:
+CLIF 2.1 tables in parquet, CSV, or FST format, named `clif_{table}.{ext}`:
 
-| Table | Required Columns |
-|-------|------------------|
-| `clif_patient` | patient_id, race_category, ethnicity_category, sex_category |
-| `clif_hospitalization` | patient_id, hospitalization_id, age_at_admission, admission_dttm, discharge_dttm, discharge_category |
-| `clif_adt` | hospitalization_id, hospital_id, location_category, in_dttm, out_dttm |
-| `clif_hospital_diagnosis` | hospitalization_id, diagnosis_code, diagnosis_code_format |
-| `clif_medication_admin_continuous` | hospitalization_id, admin_dttm, med_category, med_dose, med_dose_unit |
-| `clif_medication_admin_intermittent` | hospitalization_id, admin_dttm, med_category, med_dose, med_dose_unit |
-| `clif_respiratory_support` | hospitalization_id, device_category, recorded_dttm |
-| `clif_crrt_therapy` | hospitalization_id, recorded_dttm |
-| `clif_code_status` | patient_id, start_dttm, code_status_category |
-| `clif_vitals` | hospitalization_id, recorded_dttm, vital_category, vital_value |
-| `clif_labs` | hospitalization_id, lab_result_dttm, lab_category, lab_value |
+| Table | Columns used |
+|-------|--------------|
+| `patient` | patient_id, sex_category, race_category, ethnicity_category, language_category |
+| `hospitalization` | patient_id, hospitalization_id, age_at_admission, admission_dttm, discharge_dttm, discharge_category, census_block_code, census_block_group_code |
+| `adt` | hospitalization_id, hospital_id, hospital_type, location_category, in_dttm, out_dttm |
+| `vitals` | hospitalization_id, recorded_dttm, vital_category, vital_value |
+| `labs` | loaded and validated only |
+| `hospital_diagnosis` | hospitalization_id, diagnosis_code, diagnosis_code_format, poa_present |
+| `medication_admin_continuous` | hospitalization_id, admin_dttm, med_category, med_dose, med_dose_unit, mar_action_category |
+| `medication_admin_intermittent` | hospitalization_id, admin_dttm, med_category, med_dose, med_dose_unit |
+| `respiratory_support` | hospitalization_id, device_category, recorded_dttm |
+| `crrt_therapy` | hospitalization_id, recorded_dttm |
+| `code_status` | patient_id, start_dttm, code_status_category |
+| `patient_procedures` | hospitalization_id, procedure_code, procedure_code_format, procedure_billed_dttm |
 
-### Required med_category Values
+### Required `med_category` values
 
-In `clif_medication_admin_continuous`:
-- `norepinephrine`
-- `vasopressin`
-- `epinephrine`
-- `phenylephrine`
-- `dopamine`
-- `angiotensin` (angiotensin II)
+- `medication_admin_continuous`: `norepinephrine`, `vasopressin`, `epinephrine`, `phenylephrine`, `dopamine`, `angiotensin`
+- `medication_admin_intermittent`: `methylene_blue`, `hydroxocobalamin`
 
-In `clif_medication_admin_intermittent`:
-- `methylene_blue`
-- `hydroxocobalamin`
+### Optional files in `config/`
 
-### Required Config Files
-
-Place these in `config/`:
-
-1. **config_clif_pressors.yaml** - Site-specific configuration
-2. **clif_sites.csv** - List of valid site names
-3. **svi_2020.parquet** - Social Vulnerability Index data (optional)
-4. **adi_2020.parquet** - Area Deprivation Index data (optional)
+- `svi_2020.parquet`, `adi_2020.parquet`: neighborhood indices. SVI/ADI are set to NA if absent or if `census_block_code` is unusable.
+- `PClassR_v2026-1.csv`: AHRQ procedure classes for the major-procedure flag. If absent, `major_procedure_01` is 0 for all encounters.
 
 ---
 
-## Setup Instructions
+## Setup
 
-### 1. Clone or Download the Repository
+1. Clone the repository.
 
-```bash
-git clone <repository_url>
-cd clif_pressors
-```
+   ```bash
+   git clone https://github.com/p-lyons/021_vasoactive-epi.git
+   ```
 
-### 2. Create Configuration File
+2. Copy the config template and edit it for your site. `config/config_clif_pressors.yaml` is git-ignored.
 
-Create `config/config_clif_pressors.yaml`:
+   ```bash
+   cp config/config_clif_pressors_EXAMPLE.yaml config/config_clif_pressors.yaml
+   ```
 
-```yaml
-# Site identifier (lowercase, must match clif_sites.csv)
-site_lowercase: "ohsu"
+3. Confirm that your `site_lowercase` value is in `config/clif_sites.csv`.
 
-# File format of your CLIF tables: "parquet", "csv", or "fst"
-file_type: "parquet"
+4. Open `021_vasoactive-epi.Rproj` in RStudio. Run `renv::restore()` to install the package versions in `renv.lock`, or let `00_setup.R` install missing packages.
 
-# Path to folder containing CLIF tables
-clif_data_location: "/path/to/clif_tables"
+---
 
-# Path to this project folder
-project_location: "/path/to/clif_pressors"
-```
+## Running the pipeline
 
-### 3. Verify clif_sites.csv
-
-Ensure `config/clif_sites.csv` contains your site name:
-
-```csv
-site_name
-emory
-jhu
-northwestern
-ohsu
-...
-```
-
-### 4. Install R Packages
-
-The pipeline will auto-install missing packages, but you can pre-install:
+Run the full site pipeline from the project root:
 
 ```r
-install.packages(c(
-  "data.table", "tidyverse", "tidytable", "collapse",
-  "arrow", "here", "comorbidity", "yaml", "janitor",
-  "tableone", "smd"
-))
+source(here::here("code", "run_all.R"))
 ```
 
----
-
-## Running the Pipeline
-
-### Option 1: Run All Scripts
+Then run the Sankey export. It is standalone (it rebuilds the cohort itself), so it can run in a fresh session:
 
 ```r
-source("run_all.R")
+source(here::here("code", "sankey_transitions_onepass.R"))
 ```
 
-This executes all scripts in sequence and reports elapsed time.
-
-### Option 2: Run Scripts Individually
-
-```r
-source("00_setup.R")    # Load packages, validate data
-source("01_cohort.R")   # Build cohort, apply exclusions
-source("02_variables.R") # Define outcomes and variables
-source("03_table.R")    # Generate summary statistics
-```
+**Check after both runs:** the exclusion cascade counts in `upload_to_box/exclusion_cascade_{site}.csv` must match the `n_*` columns in `output/sankey_site_summary_{site}.csv`.
 
 ---
 
-## Output Files
+## Output files
 
-All files for upload are saved to `upload_to_box/`:
+### `upload_to_box/` (send to the coordinating site)
 
-### Table 1 Components (for pooling)
+All `table1_*` and `flow_diagram` files are stratified by hospital (`hospital` = hospital at T0) and also carry `hospital = "site_total"` rows. Exclude `site_total` rows when summing across hospitals.
 
-| File | Description |
-|------|-------------|
-| `table1_continuous_{site}.csv` | Continuous variable summary stats (n, sum, sumsq, percentiles) |
-| `table1_binary_{site}.csv` | Binary variable counts (n, n_1) |
-| `table1_categorical_{site}.csv` | Categorical variable counts by category |
-| `table1_timing_{site}.csv` | Timing group distributions (before T0, after T0, none) |
-| `table1_totals_{site}.csv` | Total N per outcome group |
+| File | Contents |
+|------|----------|
+| `table1_continuous_{site}.csv` | n, missing, sum, sum of squares, min, max, percentiles by hospital and outcome group |
+| `table1_binary_{site}.csv` | n and n_1 by hospital and outcome group |
+| `table1_categorical_{site}.csv` | Cell counts by hospital, outcome group, and category |
+| `table1_timing_{site}.csv` | IMV and CRRT timing groups (none / before T0 / T0 to 48 h) |
+| `table1_totals_{site}.csv` | Encounters and patients by hospital and outcome group |
+| `flow_diagram_{site}.csv` | Outcome-group counts by hospital |
+| `exclusion_cascade_{site}.csv` | Exclusion counts by step |
+| `qc_missing_{site}.csv` | Missingness by variable and hospital |
+| `qc_ranges_{site}.csv` | Distribution of continuous variables (site level) |
+| `qc_flags_{site}.csv` | Plausibility flag counts (site level) |
+| `qc_categories_{site}.csv` | Category frequencies (site level) |
+| `qc_diagnostics_{site}.csv` | Key metrics by hospital; study period as year-month |
+| `qc_hospital_{site}.csv` | Hospital attribution checks |
 
-### Flow Diagram
+### `output/` (send to the coordinating site)
 
-| File | Description |
-|------|-------------|
-| `flow_diagram_{site}.csv` | Counts by outcome group |
-| `exclusion_cascade_{site}.csv` | Step-by-step exclusion counts |
+| File | Contents |
+|------|----------|
+| `sankey_transitions_{site}.csv` | Counts of 6-hour block-to-block state transitions over 48 h |
+| `sankey_site_summary_{site}.csv` | Cohort size, exclusion cascade, settings |
 
-### QC Files
+### `proj_tables/` (local only; never upload or commit)
 
-| File | Description |
-|------|-------------|
-| `qc_missingness_{site}.csv` | Missing data rates by variable |
-| `qc_ranges_{site}.csv` | Min/max/median for continuous variables |
-| `qc_categories_{site}.csv` | Category frequencies |
-| `qc_diagnostics_{site}.csv` | Key site metrics for validation |
-
-### Intermediate Files (proj_tables/)
-
-These are saved locally for debugging but do **not** need to be uploaded:
-
-- `cohort.parquet` - Final cohort with all variables
-- `hid_jid_crosswalk.parquet` - Hospitalization ID linkage
-- `vasoactive_doses.parquet` - Time-series of vasopressor doses
+Patient-level intermediates: `cohort.parquet`, `cohort_analytic.parquet`, `hid_jid_crosswalk.parquet`, `vasoactive_doses.parquet`, `exclusion_cascade.csv`.
 
 ---
 
-## Script Descriptions
+## Small-cell policy
 
-### 00_setup.R
-- Loads and installs required packages
-- Configures parallel processing (threads based on available RAM)
-- Reads site configuration from YAML
-- Loads CLIF tables as Arrow datasets
-- Validates required tables and columns exist
-
-### 01_cohort.R
-- Links contiguous hospitalizations (≤6 hour gaps)
-- Applies inclusion/exclusion criteria
-- Identifies T0 for each encounter
-- Builds vasoactive_doses table with carry-forward logic
-- Adds demographics, Elixhauser comorbidities, IMV/CRRT times
-- Saves exclusion cascade
-
-### 02_variables.R
-- Defines 48-hour outcome window
-- Identifies escalation events (continuous and intermittent drugs)
-- Calculates maximum NE-equivalent dose (with dose caps)
-- Determines IMV and CRRT timing relative to T0
-- Adds code status, SVI, ADI
-- Assigns 4-way outcome groups
-
-### 03_table.R
-- Generates poolable summary statistics by outcome group
-- Continuous variables: n, sum, sum of squares, percentiles
-- Binary variables: n, n with value=1
-- Categorical variables: counts per category
-- Creates QC diagnostics and flow diagram
+- Counts of 1–4 are masked (NA) at the site only for sensitive demographic variables: sex, race, ethnicity, and language.
+- All other counts are not PHI and are not masked.
+- Site files are pooled at the coordinating site under the consortium data use agreement before anything is shared.
+- Hospital-level variation ranges are reported only for hospitals with at least 30 T0-eligible encounters.
 
 ---
 
 ## Variables
 
-### Norepinephrine Equivalent Calculation
+### Norepinephrine-equivalent dose
 
 ```
-NE-equiv = NE + Epi + (2.5 × VP) + (0.1 × Phenyl) + (0.01 × Dopa) + (0.01 × A2)
+NEE = NE + Epi + (2.5 x VP) + (0.1 x Phenyl) + (0.01 x Dopa) + (0.01 x A2)
 ```
 
-**Dose caps applied before calculation:**
+Doses are capped before the calculation:
 
 | Drug | Cap | Units |
 |------|-----|-------|
@@ -287,58 +224,38 @@ NE-equiv = NE + Epi + (2.5 × VP) + (0.1 × Phenyl) + (0.01 × Dopa) + (0.01 × 
 | Dopamine | 20 | mcg/kg/min |
 | Angiotensin II | 80 | ng/kg/min |
 
-### Table 1 Variables
+### Hospital at T0
 
-**Characteristics:**
-- Age (years)
-- Female sex
-- White race (vs non-white; unknown coded as NA)
-- Hispanic ethnicity (vs non-Hispanic; unknown coded as NA)
-- Van Walraven comorbidity score
-- Social Vulnerability Index percentile
-- Area Deprivation Index percentile
-- Full code status at T0
-- Days in hospital before T0
-- Days in ICU before T0
-- Invasive mechanical ventilation at T0
-- CRRT at T0
+`hospital_id_t0` is the `hospital_id` of the last ADT row at or before T0 (else the first ADT row of the encounter). `academic_01` comes from the `hospital_type` of the same ADT row.
 
-**Outcomes:**
-- In-hospital mortality
-- Discharge to hospice
-- Length of stay after T0
-- Maximum NE-equivalent dose in 48h
-- Receipt of epinephrine, phenylephrine, dopamine, angiotensin II
-- Receipt of methylene blue, hydroxocobalamin
+### Sankey states (Protocol Sec 6.3.1)
+
+States are assigned at each 6-hour block boundary from T0 to 48 h, with a within-block look-back that keeps the most severe state reached in the block.
+
+| State | Definition (active agents) |
+|-------|----------------------------|
+| D | Died or discharged to hospice |
+| W | No vasopressor |
+| S1 | One agent |
+| S0 | Vasopressin + one adrenergic agent |
+| S2a | Two or more adrenergic agents |
+| S2b | Angiotensin II + norepinephrine and/or vasopressin (three or fewer agents) |
+| S3 | Four or more agents, or angiotensin II + epinephrine, phenylephrine, or dopamine |
 
 ---
 
 ## Troubleshooting
 
-### "Missing required tables"
-Ensure all CLIF tables are in the folder specified by `clif_data_location` and follow the naming convention `clif_{table_name}.parquet`.
+**"Missing required tables"**: confirm that all tables are in `clif_data_location` and are named `clif_{table}.{ext}`.
 
-### "Invalid site"
-Your `site_lowercase` in the config file must match a row in `config/clif_sites.csv`.
+**"Invalid site"**: `site_lowercase` must match a row in `config/clif_sites.csv`.
 
-### Validation errors for missing values
-Some categories (e.g., race, med_category) must contain expected values. Check that your CLIF tables use standard CLIF category names.
+**Empty cohort**: check `med_dose_unit` values and the dose distributions that `01_cohort.R` prints after unit correction.
 
-### Empty cohort
-- Verify your site has patients receiving norepinephrine AND vasopressin concurrently
-- Check that med_dose_unit is standardized (mcg/kg/min for pressors, units/min for vasopressin)
-- Review vasoactive_doses.parquet for dose distributions
-
-### Memory errors
-The pipeline auto-configures threads based on available RAM. If you still encounter memory issues, you can manually reduce threads in 00_setup.R:
-```r
-n_threads = 2L  # Override automatic detection
-```
+**Memory errors**: reduce threads manually in `00_setup.R` (for example, `n_threads = 2L`).
 
 ---
 
 ## Contact
 
-For questions about the pipeline, contact the coordinating center.
-
-For site-specific data issues, contact your local CLIF data team.
+Pipeline questions: the coordinating site (OHSU). Site data questions: your local CLIF data team.

@@ -1,6 +1,6 @@
 # ==============================================================================
 # 00_setup.R
-# Vasopressor Escalation in Septic Shock - CLIF Consortium
+# Vasopressor Escalation in Refractory Distributive Shock - CLIF Consortium
 # Setup: packages, environment, data loading, validation
 # ==============================================================================
 
@@ -56,7 +56,11 @@ all_cores = if (is.na(all_cores)) 1L else as.integer(all_cores)
 
 get_ram_gb = function() {
   tryCatch({
-    if (os_type == "Darwin") {
+    if (os_type == "Windows") {
+      raw = system("wmic OS get FreePhysicalMemory /value", intern = TRUE)
+      kb  = suppressWarnings(as.numeric(gsub("\\D", "", paste(raw, collapse = ""))))
+      if (length(kb) > 0 && !is.na(kb)) kb / 1024^2 else NA_real_
+    } else if (os_type == "Darwin") {
       bytes = suppressWarnings(as.numeric(system("sysctl -n hw.memsize", intern = TRUE)))
       if (length(bytes) > 0 && !is.na(bytes)) bytes / 1024^3 else NA_real_
     } else {
@@ -428,7 +432,8 @@ validation_specs = list(
 
 validate_all_tables(data_list, validation_specs)
 
-rm(patient_spec, hosp_spec, adt_spec, dx_spec, med_spec, resp_spec, validation_specs)
+rm(patient_spec, hosp_spec, adt_spec, dx_spec, med_spec_c, med_spec_i, resp_spec, 
+   code_spec, crrt_spec, proc_spec, validation_specs)
 gc()
 
 message("\n✅ 00_setup.R complete. Proceed to 01_cohort.R")
