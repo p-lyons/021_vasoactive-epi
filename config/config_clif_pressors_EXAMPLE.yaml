@@ -1,6 +1,9 @@
 # ==============================================================================
-# config_clif_pressors.yaml
-# CLIF Vasopressor Escalation Study - Site Configuration
+# config_clif_pressors_EXAMPLE.yaml
+# CLIF Vasopressor Escalation Study - Site Configuration TEMPLATE
+#
+# Copy this file to config/config_clif_pressors.yaml and edit the values.
+# config_clif_pressors.yaml is git-ignored, so your local paths stay local.
 # ==============================================================================
 
 # Site identifier (lowercase)
@@ -16,5 +19,9 @@ file_type: "parquet"
 clif_data_location: "/path/to/your/clif_tables"
 
 # Path to this project folder
-# This is where the R scripts and config folder are located
-project_location: "/path/to/clif_pressors"
+# This is where the code/ and config/ folders are located
+project_location: "/path/to/021_vasoactive-epi"
+
+# IANA time zone of your site's timestamps (see the tz column of clif_sites.csv)
+# Used by code/sankey_transitions_onepass.R; defaults to "UTC" if omitted
+time_zone: "America/Chicago"

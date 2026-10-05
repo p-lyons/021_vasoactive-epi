@@ -1,7 +1,11 @@
 # ==============================================================================
 # 01_cohort.R
-# Vasopressor Escalation in Septic Shock - CLIF Consortium
-# Cohort: adults on norepinephrine >= 0.2 mcg/kg/min + vasopressin concurrently
+# Vasopressor Escalation in Refractory Distributive Shock - CLIF Consortium
+# Cohort: adults on norepinephrine >= 0.2 mcg/kg/min + vasopressin, with no
+#   other continuous vasopressor active at T0 or at any MAR time before T0.
+# Dose activity: a dose is active only if > 0, not a "stopped" action, and
+#   charted within the 4h carry-forward window (Sec 5.4.2). Mirrored in
+#   sankey_transitions_onepass.R STEPS 1-6; change both together.
 # ==============================================================================
 
 # Requires: data_list, site_lowercase, project_location from 00_setup.R
@@ -21,7 +25,11 @@ all_cores = if (exists("all_cores")) all_cores else {
 if (!exists("avail_ram_gb") || !is.finite(avail_ram_gb)) {
   get_ram_gb = function() {
     tryCatch({
-      if (Sys.info()[["sysname"]] == "Darwin") {
+      if (Sys.info()[["sysname"]] == "Windows") {
+        raw = system("wmic OS get FreePhysicalMemory /value", intern = TRUE)
+        kb  = suppressWarnings(as.numeric(gsub("\\D", "", paste(raw, collapse = ""))))
+        if (length(kb) > 0 && !is.na(kb)) kb / 1024^2 else NA_real_
+      } else if (Sys.info()[["sysname"]] == "Darwin") {
         bytes = suppressWarnings(as.numeric(system("sysctl -n hw.memsize", intern = TRUE)))
         if (length(bytes) > 0 && !is.na(bytes)) bytes / 1024^3 else NA_real_
       } else if (file.exists("/proc/meminfo")) {
@@ -50,9 +58,47 @@ Sys.setenv(ARROW_NUM_THREADS     = n_threads)
 options(mc.cores                 = n_threads)
 
 message(
-  sprintf("01 resources | OS=%s | Cores=%d | Threads=%d | RAM≈%s GB",
-          os_type, all_cores, n_threads,
-          ifelse(is.finite(avail_ram_gb), round(avail_ram_gb, 1), "NA"))
+  sprintf(
+    "01 resources | OS=%s | Cores=%d | Threads=%d | RAM≈%s GB",
+    os_type,
+    all_cores,
+    n_threads,
+    ifelse(is.finite(avail_ram_gb), round(avail_ram_gb, 1), "NA")
+  )
+)
+
+# study constants (must match sankey_transitions_onepass.R) --------------------
+
+link_hours           = 6L     # contiguous-encounter gap, Sec 5.3
+cf_window_h          = 4      # carry-forward window (hours), Sec 5.4.2
+ne_threshold         = 0.2    # NE mcg/kg/min for T0, Sec 5.4
+third_line_grace_min = 0      # 0 = primary; 60 = sensitivity arm
+
+scoped_pressors = c(
+  "norepinephrine",
+  "vasopressin",
+  "epinephrine",
+  "phenylephrine",
+  "dopamine",
+  "angiotensin"
+)
+
+ang2_aliases = c(
+  "angiotensin_ii",
+  "angiotensin ii",
+  "angiotensin_2",
+  "angiotensin2",
+  "ang2",
+  "angii"
+)
+
+dose_cols = c(
+  norepinephrine = "ne_dose",
+  vasopressin    = "vp_dose",
+  epinephrine    = "epi_dose",
+  phenylephrine  = "phenyl_dose",
+  dopamine       = "dopa_dose",
+  angiotensin    = "a2_dose"
 )
 
 # initialize exclusion tracking ------------------------------------------------
@@ -96,8 +142,7 @@ hosp_blocks =
 
 ## use data.table to find joined hospitalizations with <= 6h gaps --------------
 
-link_hours = 6L
-linked     = as.data.table(hosp_blocks)
+linked = as.data.table(hosp_blocks)
 setorder(linked, patient_id, admission_dttm)
 
 # calculate gaps between encounters
@@ -221,8 +266,24 @@ cohort =
 rm(linked, cohort_data, inpatient_hids, inpatient_jids, drop_ob, drop_ob_jids); gc()
 
 # ==============================================================================
-# STEP 4: Quality control - duplicates and deaths
+# STEP 4: Quality control - disposition, duplicates, and deaths
 # ==============================================================================
+
+## missing discharge category --------------------------------------------------
+
+n_before_dispo = nrow(cohort)
+
+cohort = fsubset(
+  cohort,
+  !is.na(discharge_category) & trimws(as.character(discharge_category)) != ""
+)
+
+add_exclusion(
+  "04_missing_discharge_category",
+  n_before_dispo,
+  nrow(cohort),
+  "Missing discharge category"
+)
 
 ## check for duplicates --------------------------------------------------------
 
@@ -240,10 +301,12 @@ message("✅ No duplicate joined_hosp_id found.")
 
 ## YODO (you only die once) ----------------------------------------------------
 
+n_before_yodo = nrow(cohort)
+
 ### death duplicates -----------------------------------------------------------
 
 dup_deaths = 
-  fsubset(cohort, discharge_category == "Expired") |>
+  fsubset(cohort, tolower(discharge_category) == "expired") |>
   roworder(admission_dttm, discharge_dttm) |>
   fgroup_by(patient_id) |>
   fmutate(one = 1L) |>
@@ -291,6 +354,13 @@ if (nrow(post_death_admissions) > 0) {
   )
 }
 
+add_exclusion(
+  "04b_yodo_cleanup",
+  n_before_yodo,
+  nrow(cohort),
+  "Duplicate death or post-death encounter"
+)
+
 message("✅ Cleaned duplicate deaths and post-death encounters.")
 
 rm(dupes, dup_deaths, death_times, post_death_admissions, start_date, end_date)
@@ -303,136 +373,217 @@ if (exists("n_dupes")) rm(n_dupes)
 if (exists("n_pats")) rm(n_pats)
 gc()
 
-cohort_pats = funique(cohort$patient_id)
-cohort_jids = funique(cohort$joined_hosp_id)
-cohort_hids = funique(hid_jid_crosswalk$hospitalization_id)
-date_frame  = select(cohort, patient_id, joined_hosp_id, ends_with("dttm"))
+cohort_pats       = funique(cohort$patient_id)
+cohort_jids       = funique(cohort$joined_hosp_id)
+hid_jid_crosswalk = fsubset(hid_jid_crosswalk, joined_hosp_id %in% cohort_jids)
+cohort_hids       = funique(hid_jid_crosswalk$hospitalization_id)
+date_frame        = select(cohort, patient_id, joined_hosp_id, ends_with("dttm"))
 
 # ==============================================================================
-# STEP 5: Identify T0 (NE >= 0.2 + vasopressin)
+# STEP 5: Continuous vasopressor MAR: extract, normalize, clean
 # ==============================================================================
 
-message("\n== Identifying T0: NE >= 0.2 + vasopressin ==")
+message("\n== Extracting continuous vasopressor records ==")
 
-## pull all NE and vasopressin administrations ---------------------------------
+## first in-encounter weight (dose-unit correction) ----------------------------
 
-vlist = c("norepinephrine", "vasopressin")
-
-va = 
-  dplyr::filter(data_list$medication_admin_continuous, med_category %in% vlist) |>
-  dplyr::select(hospitalization_id, admin_dttm, med_category, med_dose, med_dose_unit, mar_action_category) |>
-  dplyr::collect() |>
-  distinct()
-
-va = 
-  join(va, hid_jid_crosswalk, how = "inner", multiple = TRUE) |>
-  join(date_frame,            how = "inner", multiple = TRUE) |>
-  fsubset(admin_dttm >= admission_dttm) |>
-  fsubset(admin_dttm <= discharge_dttm) 
-
-message(sprintf("  Raw NE/VP records: %d", nrow(va)))
-
-## weight correction for non-weight-based doses --------------------------------
-
-w = 
+w_raw = 
   dplyr::filter(data_list$vitals, vital_category == "weight_kg") |>
   dplyr::filter(hospitalization_id %in% cohort_hids) |>
   dplyr::select(hospitalization_id, recorded_dttm, weight_kg = vital_value) |>
   dplyr::collect() |>
   funique()
 
+w_enc = 
+  join(w_raw, hid_jid_crosswalk, how = "inner", multiple = TRUE) |>
+  join(date_frame,               how = "inner", multiple = TRUE) |>
+  fsubset(recorded_dttm >= admission_dttm & recorded_dttm <= discharge_dttm)
+
 w = 
-  join(w, hid_jid_crosswalk, how = "inner", multiple = TRUE) |>
-  join(date_frame,           how = "inner", multiple = TRUE) |>
-  fsubset(recorded_dttm >= admission_dttm) |>
-  fsubset(recorded_dttm <= discharge_dttm) |>
-  roworder(recorded_dttm) |>
+  roworder(w_enc, recorded_dttm) |>
   fgroup_by(joined_hosp_id) |>
   fsummarize(weight_kg = ffirst(weight_kg))
 
-va = 
-  join(va, w, how = "left", multiple = TRUE) |>
-  fmutate(
-    weight_kg     = if_else(is.na(weight_kg), 70, weight_kg),
-    med_dose      = case_when(
-      med_dose_unit == "mcg/min"      ~ med_dose / weight_kg,
-      med_dose_unit == "units/kg/min" ~ med_dose * weight_kg,
-      TRUE                            ~ med_dose
-    ),
-    med_dose_unit = case_when(
-      med_dose_unit == "mcg/min"      ~ "mcg/kg/min",
-      med_dose_unit == "units/kg/min" ~ "units/min",
-      TRUE                            ~ med_dose_unit
-    )
-  ) 
+rm(w_raw, w_enc)
+
+## pull all scoped vasopressors ------------------------------------------------
+
+mar_match = c(scoped_pressors, ang2_aliases)
+
+mar_cols = c(
+  "hospitalization_id",
+  "admin_dttm",
+  "med_category",
+  "med_dose",
+  "med_dose_unit",
+  "mar_action_category"
+)
+
+mar_raw = tryCatch(
+  {
+    dplyr::filter(
+      data_list$medication_admin_continuous,
+      tolower(med_category) %in% mar_match
+    ) |>
+      dplyr::select(dplyr::all_of(mar_cols)) |>
+      dplyr::collect()
+  },
+  error = function(e) {
+    # list<string> med_category at some sites has no Arrow string kernel
+    message("  NOTE: lazy med_category filter failed; collecting then flattening.")
+    raw = dplyr::select(
+      data_list$medication_admin_continuous,
+      dplyr::all_of(mar_cols)
+    ) |>
+      dplyr::collect()
+    if (is.list(raw$med_category)) {
+      raw$med_category = vapply(
+        raw$med_category,
+        function(z) if (length(z) == 0 || is.null(z)) NA_character_ else as.character(z[[1]]),
+        character(1)
+      )
+    }
+    raw[tolower(raw$med_category) %in% mar_match, ]
+  }
+)
+
+## normalize agent names and restrict to cohort encounters ---------------------
+
+mar = unique(as.data.table(mar_raw))
+mar[, agent := tolower(trimws(as.character(med_category)))]
+mar[agent %chin% ang2_aliases, agent := "angiotensin"]
+mar = mar[agent %chin% scoped_pressors]
+
+mar = join(mar, hid_jid_crosswalk, how = "inner", multiple = TRUE)
+mar = join(
+  mar,
+  fselect(date_frame, joined_hosp_id, admission_dttm, discharge_dttm),
+  how      = "inner",
+  multiple = TRUE
+)
+mar = mar[admin_dttm >= admission_dttm & admin_dttm <= discharge_dttm]
+
+## weight and unit correction --------------------------------------------------
+## output units: catecholamines mcg/kg/min, vasopressin units/min,
+## angiotensin ng/kg/min
+
+mar = join(mar, w, how = "left", multiple = FALSE)
+mar[is.na(weight_kg), weight_kg := 70]
+mar[, med_dose_unit := tolower(trimws(med_dose_unit))]
+
+mar[, dose_mult := fcase(
+  med_dose_unit %chin% c("mcg/min", "ng/min"), 1 / weight_kg,
+  med_dose_unit == "units/kg/min",             weight_kg,
+  med_dose_unit == "units/hr",                 1 / 60,
+  default = 1
+)]
+
+mar[, med_dose := med_dose * dose_mult]
+
+## stop actions and one record per agent-timestamp -----------------------------
+
+mar[, is_stop := !is.na(mar_action_category) & tolower(mar_action_category) == "stopped"]
+mar[is_stop == TRUE, med_dose := 0]
+
+mar_ts = mar[
+  ,
+  .(
+    med_dose = fmax(med_dose),
+    is_stop  = all(is_stop)
+  ),
+  by = .(joined_hosp_id, agent, admin_dttm)
+]
 
 ## diagnostic: dose distributions ----------------------------------------------
 
-message("  Dose distributions after weight correction:")
-dose_summary = va[, .(
-  n      = .N,
-  min    = min(med_dose, na.rm = TRUE),
-  median = median(med_dose, na.rm = TRUE),
-  max    = max(med_dose, na.rm = TRUE)
-), by = med_category]
+message("  Dose distributions after weight and unit correction:")
+
+dose_summary = mar_ts[
+  ,
+  .(
+    n      = .N,
+    min    = fmin(med_dose),
+    median = fmedian(med_dose),
+    max    = fmax(med_dose)
+  ),
+  by = agent
+]
+
 print(dose_summary)
 
-## filter to encounters with NE >= 0.2 at some point AND vasopressin -----------
+## EXCLUSION STEP 5: no usable NE or VP dose -----------------------------------
 
-ne_encs = 
-  fgroup_by(va, joined_hosp_id, med_category) |>
-  fsummarize(max_dose = fmax(med_dose)) |>
-  fsubset(med_category == "norepinephrine") |>
-  fsubset(max_dose >= 0.2) |>
-  pull(joined_hosp_id)
+bad_mar = mar_ts[
+  agent %chin% c("norepinephrine", "vasopressin"),
+  .(usable = any(is.finite(med_dose) & med_dose > 0)),
+  by = joined_hosp_id
+][usable == FALSE, joined_hosp_id]
 
-vaso_encs = 
-  fsubset(va, med_category == "vasopressin") |>
-  pull(joined_hosp_id) |>
-  funique()
+n_before_mar = nrow(cohort)
+cohort       = fsubset(cohort, !joined_hosp_id %in% bad_mar)
+mar_ts       = mar_ts[joined_hosp_id %in% cohort$joined_hosp_id]
 
-message(sprintf("  Encounters with NE >= 0.2: %d", length(ne_encs)))
-message(sprintf("  Encounters with VP: %d", length(vaso_encs)))
-message(sprintf("  Encounters with BOTH: %d", length(intersect(ne_encs, vaso_encs))))
+add_exclusion(
+  "05_uninterpretable_mar",
+  n_before_mar,
+  nrow(cohort),
+  "No usable NE or VP dose"
+)
 
-va = 
-  fsubset(va, joined_hosp_id %in% ne_encs & joined_hosp_id %in% vaso_encs) |>
-  fgroup_by(joined_hosp_id, admin_dttm, med_category, mar_action_category) |>
-  fsummarize(med_dose = fmax(med_dose)) |>
-  ftransform(med_dose = if_else(mar_action_category == "stopped", 0, med_dose))
+rm(mar_raw, mar, dose_summary, bad_mar, w)
+gc()
 
-## separate NE and VP, then carry-forward to align times -----------------------
+# ==============================================================================
+# STEP 6: Active-dose snapshot, T0, and third-line-before-T0 exclusion
+# ==============================================================================
 
-ne         = fsubset(va, med_category == "norepinephrine") |> fselect(-med_category)
-vaso       = fsubset(va, med_category == "vasopressin")
-ne_times   = fselect(ne,   joined_hosp_id, admin_dttm) |> funique()
-vaso_times = fselect(vaso, joined_hosp_id, admin_dttm) |> funique()
+message("\n== Identifying T0: NE >= 0.2 + vasopressin, no other pressor ==")
 
-# carry-forward NE doses to vasopressin time points
-ne = 
-  join(ne, vaso_times, how = "full", multiple = TRUE) |>
-  roworder(admin_dttm) |>
-  fill(everything(), .direction = "down", .by = joined_hosp_id) |>
-  fsubset(!is.na(med_dose)) |>
-  fselect(joined_hosp_id, admin_dttm, ne_dose = med_dose)
+## snapshot every agent at every MAR timestamp (4h carry-forward) --------------
+## dose column = dose if active, else NA
 
-# carry-forward VP doses to NE time points
-vaso = 
-  join(vaso, ne_times, how = "full", multiple = TRUE) |>
-  roworder(admin_dttm) |>
-  fill(everything(), .direction = "down", .by = joined_hosp_id) |>
-  fsubset(!is.na(med_dose)) |>
-  fselect(joined_hosp_id, admin_dttm, vp_dose = med_dose)
+snap = unique(mar_ts[, .(joined_hosp_id, eval_dttm = admin_dttm)])
 
-## T0 = first time with NE >= 0.2 AND VP present -------------------------------
+for (a in scoped_pressors) {
+  
+  rec = mar_ts[
+    agent == a,
+    .(joined_hosp_id, admin_dttm, rec_dttm = admin_dttm, dose = med_dose, is_stop)
+  ]
+  
+  rolled = rec[
+    snap[, .(joined_hosp_id, admin_dttm = eval_dttm)],
+    on   = .(joined_hosp_id, admin_dttm),
+    roll = TRUE
+  ]
+  
+  rolled[, gap_h := as.numeric(difftime(admin_dttm, rec_dttm, units = "hours"))]
+  rolled[, active := !is.na(dose) & !is.na(gap_h) & gap_h <= cf_window_h & dose > 0 & !is_stop]
+  
+  rolled = rolled[
+    ,
+    .(joined_hosp_id, eval_dttm = admin_dttm, dose = fifelse(active, dose, NA_real_))
+  ]
+  
+  setnames(rolled, "dose", dose_cols[[a]])
+  
+  snap = merge(
+    snap,
+    rolled,
+    by    = c("joined_hosp_id", "eval_dttm"),
+    all.x = TRUE
+  )
+}
 
-va_time_zero = 
-  join(ne, vaso, how = "full", multiple = TRUE) |>
-  fsubset(ne_dose >= 0.2) |>
-  fsubset(!is.na(vp_dose)) |>
-  roworder(admin_dttm) |>
-  fgroup_by(joined_hosp_id) |>
-  fsummarize(t0_dttm = ffirst(admin_dttm))
+rm(a, rec, rolled)
+
+## T0 = first instant with NE >= 0.2 + VP and no other agent active ------------
+
+snap[, any_block := !is.na(epi_dose) | !is.na(phenyl_dose) | !is.na(dopa_dose) | !is.na(a2_dose)]
+snap[, t0_ok := !is.na(ne_dose) & ne_dose >= ne_threshold & !is.na(vp_dose) & !any_block]
+setorder(snap, joined_hosp_id, eval_dttm)
+
+va_time_zero = snap[t0_ok == TRUE, .(t0_dttm = eval_dttm[1L]), by = joined_hosp_id]
 
 message(sprintf("  Encounters meeting T0 criteria: %d", nrow(va_time_zero)))
 
@@ -440,13 +591,36 @@ if (nrow(va_time_zero) == 0) {
   stop("No encounters meet T0 criteria. Check dose units and thresholds.", call. = FALSE)
 }
 
-## join T0 to cohort and filter ------------------------------------------------
+## EXCLUSION STEP 6: met T0 criteria -------------------------------------------
 
 n_before_t0 = nrow(cohort)
-cohort = join(cohort, va_time_zero, how = "inner", multiple = FALSE)
+cohort      = join(cohort, va_time_zero, how = "inner", multiple = FALSE)
 
-# EXCLUSION STEP 4: Met T0 criteria
-add_exclusion("04_met_t0_criteria", n_after_psych, nrow(cohort), "No concurrent NE>=0.2 + VP")
+add_exclusion(
+  "06_met_t0_criteria",
+  n_before_t0,
+  nrow(cohort),
+  "No NE>=0.2 + VP without other pressors"
+)
+
+## EXCLUSION STEP 7: third-line agent active before T0 -------------------------
+
+pre_t0 = join(snap, va_time_zero, how = "inner", multiple = FALSE)
+
+pre_t0_block = pre_t0[
+  eval_dttm < t0_dttm - third_line_grace_min * 60 & any_block,
+  funique(joined_hosp_id)
+]
+
+n_before_pre = nrow(cohort)
+cohort       = fsubset(cohort, !joined_hosp_id %in% pre_t0_block)
+
+add_exclusion(
+  "07_third_line_prior_to_t0",
+  n_before_pre,
+  nrow(cohort),
+  "Other continuous pressor before T0"
+)
 
 cohort_jids       = funique(cohort$joined_hosp_id)
 hid_jid_crosswalk = fsubset(hid_jid_crosswalk, joined_hosp_id %in% cohort_jids)
@@ -457,116 +631,28 @@ date_frame        = select(cohort, patient_id, joined_hosp_id, ends_with("dttm")
 message(sprintf("  Final cohort: %d encounters", nrow(cohort)))
 
 # ==============================================================================
-# STEP 6: Build vasoactive doses table for escalation analysis
+# STEP 7: Save vasoactive doses table (active doses; NA = not active)
 # ==============================================================================
 
 message("\n== Building vasoactive doses table ==")
 
-## pull escalation drugs -------------------------------------------------------
+va_all = snap[
+  joined_hosp_id %in% cohort_jids,
+  c("joined_hosp_id", "eval_dttm", unname(dose_cols)),
+  with = FALSE
+]
 
-big = c("epinephrine", "phenylephrine", "dopamine", "angiotensin")
-
-va_esc = 
-  dplyr::filter(data_list$medication_admin_continuous, med_category %in% big) |>
-  dplyr::select(hospitalization_id, admin_dttm, med_category, med_dose, med_dose_unit, mar_action_category) |>
-  dplyr::collect() |>
-  distinct()
-
-va_esc = 
-  join(va_esc, hid_jid_crosswalk, how = "inner", multiple = TRUE) |>
-  join(date_frame,               how = "inner", multiple = TRUE) |>
-  fsubset(admin_dttm >= admission_dttm) |>
-  fsubset(admin_dttm <= discharge_dttm) 
-
-va_esc = 
-  join(va_esc, w, how = "left", multiple = TRUE) |>
-  fmutate(
-    weight_kg     = if_else(is.na(weight_kg), 70, weight_kg),
-    med_dose      = case_when(
-      med_dose_unit == "mcg/min" ~ med_dose / weight_kg,
-      TRUE                       ~ med_dose
-    ),
-    med_dose_unit = case_when(
-      med_dose_unit == "mcg/min" ~ "mcg/kg/min",
-      TRUE                       ~ med_dose_unit
-    )
-  ) 
-
-va_esc = 
-  join(va_esc, va_time_zero, how = "inner", multiple = TRUE) |>
-  fsubset(admin_dttm >= t0_dttm - lubridate::dhours(24)) |>
-  fgroup_by(joined_hosp_id, admin_dttm, med_category, mar_action_category) |>
-  fsummarize(med_dose = fmax(med_dose)) |>
-  ftransform(med_dose = if_else(mar_action_category == "stopped", 0, med_dose))
-
-## separate and carry-forward each drug ----------------------------------------
-
-epi          = fsubset(va_esc, med_category == "epinephrine")   |> fselect(-med_category)
-phenyl       = fsubset(va_esc, med_category == "phenylephrine") |> fselect(-med_category)
-dopa         = fsubset(va_esc, med_category == "dopamine")      |> fselect(-med_category)
-ang2         = fsubset(va_esc, med_category == "angiotensin")   |> fselect(-med_category)
-
-epi_times    = fselect(epi,    joined_hosp_id, admin_dttm) |> funique()
-phenyl_times = fselect(phenyl, joined_hosp_id, admin_dttm) |> funique()
-dopa_times   = fselect(dopa,   joined_hosp_id, admin_dttm) |> funique()
-ang2_times   = fselect(ang2,   joined_hosp_id, admin_dttm) |> funique()
-
-all_times = 
-  join(ne_times, vaso_times, how = "full", multiple = TRUE) |>
-  join(epi_times,            how = "full", multiple = TRUE) |>
-  join(phenyl_times,         how = "full", multiple = TRUE) |>
-  join(dopa_times,           how = "full", multiple = TRUE) |>
-  join(ang2_times,           how = "full", multiple = TRUE) 
-
-epi = 
-  join(epi, all_times, how = "full", multiple = TRUE) |>
-  roworder(admin_dttm) |>
-  fill(everything(), .direction = "down", .by = joined_hosp_id) |>
-  fsubset(!is.na(med_dose)) |>
-  fselect(joined_hosp_id, admin_dttm, epi_dose = med_dose)
-
-phenyl = 
-  join(phenyl, all_times, how = "full", multiple = TRUE) |>
-  roworder(admin_dttm) |>
-  fill(everything(), .direction = "down", .by = joined_hosp_id) |>
-  fsubset(!is.na(med_dose)) |>
-  fselect(joined_hosp_id, admin_dttm, phenyl_dose = med_dose)
-
-dopa = 
-  join(dopa, all_times, how = "full", multiple = TRUE) |>
-  roworder(admin_dttm) |>
-  fill(everything(), .direction = "down", .by = joined_hosp_id) |>
-  fsubset(!is.na(med_dose)) |>
-  fselect(joined_hosp_id, admin_dttm, dopa_dose = med_dose)
-
-ang2 = 
-  join(ang2, all_times, how = "full", multiple = TRUE) |>
-  roworder(admin_dttm) |>
-  fill(everything(), .direction = "down", .by = joined_hosp_id) |>
-  fsubset(!is.na(med_dose)) |>
-  fselect(joined_hosp_id, admin_dttm, a2_dose = med_dose)
-
-## combine all vasoactives into single table -----------------------------------
-
-va_all = 
-  join(ne, vaso, how = "full", multiple = TRUE) |>
-  join(epi,      how = "full", multiple = TRUE) |>
-  join(phenyl,   how = "full", multiple = TRUE) |>
-  join(dopa,     how = "full", multiple = TRUE) |>
-  join(ang2,     how = "full", multiple = TRUE) |>
-  roworder(admin_dttm) |>
-  fill(everything(), .direction = "down", .by = joined_hosp_id)
+setnames(va_all, "eval_dttm", "admin_dttm")
 
 write_parquet(va_all, here("proj_tables", "vasoactive_doses.parquet"))
 
 message(sprintf("  Saved vasoactive_doses.parquet: %d rows", nrow(va_all)))
 
-rm(va, va_esc, ne, vaso, epi, phenyl, dopa, ang2, w)
-rm(ne_times, vaso_times, epi_times, phenyl_times, dopa_times, ang2_times, all_times)
+rm(mar_ts, snap, pre_t0, pre_t0_block, va_time_zero, va_all)
 gc()
 
 # ==============================================================================
-# STEP 7: Add patient demographics
+# STEP 8: Add patient demographics
 # ==============================================================================
 
 message("\n== Adding patient demographics ==")
@@ -589,8 +675,10 @@ cohort =
   fmutate(age        = if_else(age > 90, 90.9, age)) |>
   fmutate(female_01  = if_else(tolower(sex_category) == "female", 1L, 0L)) |>
   fmutate(dead_01    = if_else(tolower(discharge_category) == "expired", 1L, 0L)) |>
-  fmutate(hospice_01 = if_else(tolower(discharge_category) == "hospice", 1L, 0L)) |>
-  fmutate(los_hosp_d = as.numeric(difftime(discharge_dttm, admission_dttm), "hours") / 24) |>
+  fmutate(hospice_01 = if_else(tolower(discharge_category) == "hospice", 1L, 0L))
+
+cohort = 
+  fmutate(cohort, los_hosp_d = as.numeric(difftime(discharge_dttm, admission_dttm), "hours") / 24) |>
   mutate(across(
     .cols = where(is.character) & !any_of("patient_id"),
     .fns  = ~tolower(.x)
@@ -601,7 +689,7 @@ rm(pt_dups, cohort_demographics)
 gc()
 
 # ==============================================================================
-# STEP 8: Add Elixhauser comorbidities
+# STEP 9: Add Elixhauser comorbidities
 # ==============================================================================
 
 message("  Adding Elixhauser comorbidities...")
@@ -639,12 +727,12 @@ rm(elix, vw, unused_vect)
 gc()
 
 # ==============================================================================
-# STEP 9: Add hospital info and IMV/CRRT times
+# STEP 10: Add hospital info and IMV/CRRT times
 # ==============================================================================
 
 message("  Adding hospital and organ support info...")
 
-## hospital_id -----------------------------------------------------------------
+## hospital_id (first ADT row; 02_variables.R adds hospital at T0) -------------
 
 hospital = 
   dplyr::select(data_list$adt, hospitalization_id, in_dttm, hospital_id) |>
@@ -730,7 +818,7 @@ rm(hospital, resp, crrt, icu_admit)
 gc()
 
 # ==============================================================================
-# STEP 10: Save outputs
+# STEP 11: Save outputs
 # ==============================================================================
 
 message("\n== Saving outputs ==")

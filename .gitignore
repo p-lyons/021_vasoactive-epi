@@ -1,4 +1,19 @@
+# R / RStudio
 .Rproj.user
 .Rhistory
 .RData
 .Ruserdata
+
+# macOS
+.DS_Store
+
+# site-specific configuration (copy config/config_clif_pressors_EXAMPLE.yaml)
+config/config_clif_pressors.yaml
+
+# patient-level intermediates and site outputs: never commit
+proj_tables/
+upload_to_box/
+output/
+
+# pooled site files at the coordinating site
+sites/

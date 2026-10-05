@@ -1,6 +1,6 @@
 # ==============================================================================
 # run_all.R
-# Vasopressor Escalation in Septic Shock - CLIF Consortium
+# Vasopressor Escalation in Refractory Distributive Shock - CLIF Consortium
 # Execute full site-level pipeline: setup → cohort → variables → table
 # ==============================================================================
 
