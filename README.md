@@ -149,19 +149,19 @@ CLIF 2.1 tables in parquet, CSV, or FST format, named `clif_{table}.{ext}`:
 
 ## Running the pipeline
 
-Run the full site pipeline from the project root:
+Run the full site pipeline from the project root. It runs `00_setup.R` through `03_table.R`, then the Sankey export:
 
 ```r
 source(here::here("code", "run_all.R"))
 ```
 
-Then run the Sankey export. It is standalone (it rebuilds the cohort itself), so it can run in a fresh session:
+The Sankey export is standalone (it rebuilds the cohort itself), so it can also be run on its own in a fresh session:
 
 ```r
 source(here::here("code", "sankey_transitions_onepass.R"))
 ```
 
-**Check after both runs:** the exclusion cascade counts in `upload_to_box/exclusion_cascade_{site}.csv` must match the `n_*` columns in `output/sankey_site_summary_{site}.csv`.
+**Check after the run:** the exclusion cascade counts in `upload_to_box/exclusion_cascade_{site}.csv` must match the `n_*` columns in `output/sankey_site_summary_{site}.csv`.
 
 ---
 

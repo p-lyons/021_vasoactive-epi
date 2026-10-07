@@ -1,7 +1,7 @@
 # ==============================================================================
 # run_all.R
 # Vasopressor Escalation in Refractory Distributive Shock - CLIF Consortium
-# Execute full site-level pipeline: setup → cohort → variables → table
+# Execute full site-level pipeline: setup → cohort → variables → table → Sankey
 # ==============================================================================
 
 # Clear environment (optional - comment out if you want to preserve objects)
@@ -45,6 +45,14 @@ message("\n>>> Running 03_table.R <<<\n")
 source(here::here("code/03_table.R"))
 
 # ==============================================================================
+# sankey_transitions_onepass.R - State-transition counts (standalone; rebuilds
+# the cohort from the CLIF tables and replaces objects such as `cohort`)
+# ==============================================================================
+
+message("\n>>> Running sankey_transitions_onepass.R <<<\n")
+source(here::here("code/sankey_transitions_onepass.R"))
+
+# ==============================================================================
 # Summary
 # ==============================================================================
 
@@ -65,4 +73,10 @@ message("    - table1_timing_*.csv")
 message("    - table1_totals_*.csv")
 message("    - flow_diagram_*.csv")
 message("    - exclusion_cascade_*.csv")
-message("    - qc_*.csv\n")
+message("    - qc_*.csv")
+
+message("\n  Outputs in output/:")
+message("    - sankey_transitions_*.csv")
+message("    - sankey_site_summary_*.csv")
+message("\n  Send both folders to the coordinating site.")
+message("  Check: exclusion_cascade_*.csv counts must match the n_* columns in sankey_site_summary_*.csv\n")
