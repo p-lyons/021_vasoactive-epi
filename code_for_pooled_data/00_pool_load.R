@@ -141,6 +141,7 @@ qc_hospital_raw    = read_site_files(data_folder, "qc_hospital")
 
 exclusion_raw      = read_site_files(data_folder, "exclusion_cascade")
 sankey_trans_raw   = read_site_files(data_folder, "sankey_transitions")
+sankey_paths_raw   = read_site_files(data_folder, "sankey_paths")
 sankey_summary_raw = read_site_files(data_folder, "sankey_site_summary")
 
 # hospital stratum -------------------------------------------------------------
@@ -320,6 +321,39 @@ if (nrow(sankey_trans_raw) > 0) {
 } else {
   SANKEY_POOLED = data.table()
   message("  No Sankey transition files found")
+}
+
+# Sankey: pooled complete paths ------------------------------------------------
+
+PATH_COLS = c(
+  "state_0h",
+  "state_12h",
+  "state_24h",
+  "state_36h",
+  "outcome_48h"
+)
+
+if (nrow(sankey_paths_raw) > 0) {
+  
+  PATHS_POOLED = sankey_paths_raw[, .(
+    n       = sum(n, na.rm = TRUE),
+    n_sites = uniqueN(site)
+  ), by = PATH_COLS]
+  
+  setorderv(PATHS_POOLED, "n", order = -1L)
+  
+  if (!dir.exists(here("output", "sankey"))) {
+    dir.create(here("output", "sankey"), recursive = TRUE)
+  }
+  
+  fwrite(PATHS_POOLED, here("output", "sankey", paste0("sankey_paths_pooled_", today, ".csv")))
+  
+  message("  Pooled ", format_n(sum(PATHS_POOLED$n)), " encounters on ",
+          format_n(nrow(PATHS_POOLED)), " unique paths")
+  
+} else {
+  PATHS_POOLED = data.table()
+  message("  No Sankey path files found")
 }
 
 # Sankey: cascade must match Table 1 cascade -----------------------------------

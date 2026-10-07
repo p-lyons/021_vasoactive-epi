@@ -36,6 +36,7 @@ code_for_pooled_data/          coordinating site only: pools site outputs (run i
   01_pool_table1.R             pooled Table 1 and flow diagram
   02_pool_qc.R                 cross-site QC, hospital attribution, Sankey cascade check
   03_pool_hospital_variation.R hospital ranges (>= 30 encounters) and random-intercept ICC/MOR
+  04_pool_sankey_figure.R      alluvial figure of complete paths (0, 12, 24, 36 h states; 48 h outcome)
 config/
   config_clif_pressors_EXAMPLE.yaml   template for your site config
   clif_sites.csv               valid site names and time zones
@@ -161,7 +162,7 @@ The Sankey export is standalone (it rebuilds the cohort itself), so it can also 
 source(here::here("code", "sankey_transitions_onepass.R"))
 ```
 
-**Check after the run:** the exclusion cascade counts in `upload_to_box/exclusion_cascade_{site}.csv` must match the `n_*` columns in `output/sankey_site_summary_{site}.csv`.
+**Check after the run:** the exclusion cascade counts in `upload_to_box/exclusion_cascade_{site}.csv` must match the `n_*` columns in `upload_to_box/sankey_site_summary_{site}.csv`.
 
 ---
 
@@ -186,12 +187,8 @@ All `table1_*` and `flow_diagram` files are stratified by hospital (`hospital` =
 | `qc_categories_{site}.csv` | Category frequencies (site level) |
 | `qc_diagnostics_{site}.csv` | Key metrics by hospital; study period as year-month |
 | `qc_hospital_{site}.csv` | Hospital attribution checks |
-
-### `output/` (send to the coordinating site)
-
-| File | Contents |
-|------|----------|
 | `sankey_transitions_{site}.csv` | Counts of 6-hour block-to-block state transitions over 48 h |
+| `sankey_paths_{site}.csv` | Counts of encounters on each unique path: state at 0, 12, 24, 36 h and outcome at 48 h |
 | `sankey_site_summary_{site}.csv` | Cohort size, exclusion cascade, settings |
 
 ### `proj_tables/` (local only; never upload or commit)

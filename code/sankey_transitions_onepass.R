@@ -12,9 +12,15 @@
 #      snapshot + within-block look-back). State assignment exists only in
 #      this script.
 #   3. Counts transitions (block_from, state_from, state_to) across encounters.
+#   4. Counts complete paths: state at 0, 12, 24, 36 h + outcome at 48 h.
+#      Each 12-h state = the more severe of the two 6-h block states in the
+#      preceding 12 h (D if dead/hospice by that hour). Patients discharged
+#      alive stay W. 48-h outcome: dead_48h, alive_48h_died_later,
+#      alive_48h_survived (hospice discharge counts as death throughout).
 #
-# OUTPUTS (under <project_location>/output) -- aggregate counts only:
+# OUTPUTS (under upload_to_box/, with the Table 1 files) -- aggregate counts only:
 #   sankey_transitions_<site>.csv   block_from | state_from | state_to | n | site
+#   sankey_paths_<site>.csv         state_0h | state_12h | state_24h | state_36h | outcome_48h | n | site
 #   sankey_site_summary_<site>.csv  cohort size, exclusions, settings
 #   No patient-level rows, identifiers, or timestamps leave this script.
 #
@@ -35,7 +41,7 @@
 #     should be 0.
 #
 # CONFIG: config/config_clif_pressors.yaml (same file as 01_cohort.R). Uses
-#   clif_data_location, file_type, site_lowercase, time_zone, project_location.
+#   clif_data_location, file_type, site_lowercase, time_zone.
 # ==============================================================================
 
 # packages ---------------------------------------------------------------------
@@ -73,11 +79,9 @@ tables_location  = normalizePath(path.expand(fn_cfg("clif_data_location")), must
 file_type        = tolower(fn_cfg("file_type"))
 site_lowercase   = tolower(fn_cfg("site_lowercase"))
 site_tz          = if (is.null(config$time_zone)) "UTC" else config$time_zone
-project_location = fn_cfg("project_location")
 
-if (project_location %in% c(".", "")) project_location = here::here()
-
-dir_out = file.path(project_location, "output")
+# same folder as the Table 1 files, so sites send one folder
+dir_out = here::here("upload_to_box")
 if (!dir.exists(dir_out)) dir.create(dir_out, recursive = TRUE)
 
 # open CLIF tables (root + 2 levels, case-insensitive) -------------------------
@@ -124,6 +128,8 @@ dose_limits = c(
 )
 block_hours          = 6L     # Sec 6.2, fixed by protocol
 window_hours         = 48L    # tunable (48 or 72)
+path_hours           = c(12L, 24L, 36L)   # path states after T0 (0 h added below)
+path_outcome_hours   = 48L                # path outcome time point
 
 scoped_pressors = c(
   "norepinephrine",
@@ -584,7 +590,7 @@ if (n_not_s0 > 0) {
 }
 
 # ==============================================================================
-# STEP 9: Transition counts + site summary
+# STEP 9: Transition counts
 # ==============================================================================
 
 message("\n== Transitions ==")
@@ -621,6 +627,92 @@ if (cons[n_in != n_out, .N] > 0) {
   stop("Flow conservation failed; inspect `cons`.", call. = FALSE)
 }
 
+# ==============================================================================
+# STEP 10: Complete paths (0, 12, 24, 36 h states + 48 h outcome)
+# ==============================================================================
+
+message("\n== Paths ==")
+
+st[, rank := state_rank[state]]   # D -> NA
+
+## state at T0 -----------------------------------------------------------------
+
+path_parts = list(
+  st[block_idx == 0L, .(joined_hosp_id, col = "state_0h", state)]
+)
+
+## 12-h states: more severe of the two 6-h block states; D if dead by then ------
+
+for (h in path_hours) {
+  
+  k = as.integer(h / block_hours)
+  
+  win = st[block_idx %in% c(k - 1L, k)]
+  
+  part = win[, .(
+    is_dead  = any(block_idx == k & state == "D"),
+    max_rank = if (all(is.na(rank))) NA_integer_ else max(rank, na.rm = TRUE)
+  ), by = joined_hosp_id]
+  
+  part[, state := fifelse(
+    is_dead,
+    "D",
+    names(state_rank)[match(max_rank, state_rank)]
+  )]
+  
+  path_parts[[length(path_parts) + 1L]] = part[, .(joined_hosp_id, col = paste0("state_", h, "h"), state)]
+}
+
+rm(h, k, win, part)
+
+## 48-h outcome ----------------------------------------------------------------
+
+outcome_part = cohort[
+  joined_hosp_id %in% st$joined_hosp_id,
+  .(
+    joined_hosp_id,
+    col   = "outcome_48h",
+    state = fcase(
+      !is.na(d_instant) & d_instant <= t0_dttm + path_outcome_hours * 3600, "dead_48h",
+      !is.na(d_instant),                                                    "alive_48h_died_later",
+      default = "alive_48h_survived"
+    )
+  )
+]
+
+path_parts[[length(path_parts) + 1L]] = outcome_part
+
+path_long = rbindlist(path_parts, use.names = TRUE)
+
+path_wide = dcast(
+  path_long,
+  joined_hosp_id ~ col,
+  value.var = "state"
+)
+
+path_cols = c(
+  "state_0h",
+  paste0("state_", path_hours, "h"),
+  "outcome_48h"
+)
+
+paths = path_wide[, .(n = .N), by = path_cols]
+setorderv(paths, "n", order = -1L)
+paths[, site := site_lowercase]
+
+if (sum(paths$n) != uniqueN(st$joined_hosp_id) || anyNA(paths[, ..path_cols])) {
+  stop("Path counts do not cover every encounter exactly once; inspect `path_wide`.", call. = FALSE)
+}
+
+message(sprintf("  %d encounters on %d unique paths", sum(paths$n), nrow(paths)))
+
+st[, rank := NULL]
+rm(path_parts, outcome_part, path_long, path_wide)
+
+# ==============================================================================
+# STEP 11: Site summary and save
+# ==============================================================================
+
 summary_tab = data.table(
   site                  = site_lowercase,
   n_cohort              = nrow(cohort),
@@ -628,6 +720,7 @@ summary_tab = data.table(
   n_in_transitions      = uniqueN(st$joined_hosp_id),
   n_implausible_doses   = n_implausible,
   n_lookback_upgrades   = n_upgrade,
+  n_unique_paths        = nrow(paths),
   window_hours          = window_hours,
   block_hours           = block_hours,
   third_line_grace_min  = third_line_grace_min,
@@ -642,6 +735,7 @@ summary_tab = cbind(summary_tab, cascade_wide)
 
 fwrite(trans,       file.path(dir_out, sprintf("sankey_transitions_%s.csv",  site_lowercase)))
 fwrite(summary_tab, file.path(dir_out, sprintf("sankey_site_summary_%s.csv", site_lowercase)))
+fwrite(paths,       file.path(dir_out, sprintf("sankey_paths_%s.csv",        site_lowercase)))
 
 message(sprintf("  %d encounters -> %d transition cells (%d unresolved excluded)",
                 summary_tab$n_in_transitions, nrow(trans), length(unres)))
