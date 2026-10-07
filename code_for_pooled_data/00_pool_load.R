@@ -40,6 +40,13 @@ RESCUE_VARS = c(
   "a2_01"
 )
 
+# confirmed true zeros: the site captures the agent but never used it, so the
+# zero stays in the pooled numbers (exempt from the not-captured rule)
+TRUE_ZEROS = data.table(
+  site     = c("ohsu"),
+  variable = c("a2_01")
+)
+
 today = format(Sys.Date(), "%y%m%d")
 
 rm(site_details)
@@ -207,6 +214,12 @@ rescue_use = binary_site[
 ]
 
 NOT_CAPTURED = rescue_use[n_1 == 0, .(site, variable)]
+NOT_CAPTURED = NOT_CAPTURED[!TRUE_ZEROS, on = .(site, variable)]
+
+if (nrow(TRUE_ZEROS) > 0) {
+  message("  Confirmed true zeros (kept in pooled numbers):")
+  print(TRUE_ZEROS)
+}
 
 if (nrow(NOT_CAPTURED) > 0) {
   message("  Treated as not captured (left out of numerator and denominator):")
