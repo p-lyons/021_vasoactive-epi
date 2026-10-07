@@ -111,6 +111,17 @@ cf_window_h          = 4      # carry-forward, Sec 5.4.2
 ne_threshold         = 0.2    # NE mcg/kg/min for T0, Sec 5.4
 link_hours           = 6L     # contiguous-encounter gap, Sec 5.3
 third_line_grace_min = 0      # 0 = primary; 60 = sensitivity arm
+
+# implausible-dose limits after unit conversion (records above are deleted
+# before carry-forward, so the previous valid dose carries forward)
+dose_limits = c(
+  norepinephrine = 5,      # mcg/kg/min
+  epinephrine    = 5,      # mcg/kg/min
+  vasopressin    = 0.5,    # units/min
+  phenylephrine  = 10,     # mcg/kg/min
+  dopamine       = 50,     # mcg/kg/min
+  angiotensin    = 200     # ng/kg/min
+)
 block_hours          = 6L     # Sec 6.2, fixed by protocol
 window_hours         = 48L    # tunable (48 or 72)
 
@@ -420,6 +431,24 @@ mac[, med_dose := med_dose * dose_mult]
 mac[, is_stop := !is.na(mar_action_category) & tolower(mar_action_category) == "stopped"]
 mac[is_stop == TRUE, med_dose := 0]
 
+## implausible doses: delete record (never a stop record; stops are 0) ---------
+
+mac[, dose_limit := dose_limits[agent]]
+
+implausible = mac[
+  !is.na(med_dose) & med_dose > dose_limit,
+  .(n_records = .N, n_encounters = uniqueN(joined_hosp_id)),
+  by = agent
+]
+
+n_implausible = sum(implausible$n_records)
+
+message(sprintf("  Implausible dose records deleted: %d", n_implausible))
+if (n_implausible > 0) print(implausible)
+
+mac = mac[is.na(med_dose) | med_dose <= dose_limit]
+mac[, dose_limit := NULL]
+
 mac = mac[
   ,
   .(
@@ -597,6 +626,7 @@ summary_tab = data.table(
   n_cohort              = nrow(cohort),
   n_unresolved_excluded = length(unres),
   n_in_transitions      = uniqueN(st$joined_hosp_id),
+  n_implausible_doses   = n_implausible,
   n_lookback_upgrades   = n_upgrade,
   window_hours          = window_hours,
   block_hours           = block_hours,

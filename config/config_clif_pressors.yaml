@@ -1,5 +1,5 @@
-clif_data_location: "/Volumes/lyonslab/_clif_data/v_2.1"
-project_location: "/Users/lyonspa/Library/CloudStorage/OneDrive-OregonHealth&ScienceUniversity/_research/021_vasoactive-epi"
+clif_data_location: "/Users/plyons/Library/CloudStorage/OneDrive-OregonHealth&ScienceUniversity/_research/clif_v2.1"
+project_location: "/Users/plyons/Projects/021_vasoactive-epi"
 file_type: "parquet"
 site_lowercase: "ohsu"
 time_zone: "US/Pacific"

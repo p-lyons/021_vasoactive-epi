@@ -74,6 +74,17 @@ cf_window_h          = 4      # carry-forward window (hours), Sec 5.4.2
 ne_threshold         = 0.2    # NE mcg/kg/min for T0, Sec 5.4
 third_line_grace_min = 0      # 0 = primary; 60 = sensitivity arm
 
+# implausible-dose limits after unit conversion (records above are deleted
+# before carry-forward, so the previous valid dose carries forward)
+dose_limits = c(
+  norepinephrine = 5,      # mcg/kg/min
+  epinephrine    = 5,      # mcg/kg/min
+  vasopressin    = 0.5,    # units/min
+  phenylephrine  = 10,     # mcg/kg/min
+  dopamine       = 50,     # mcg/kg/min
+  angiotensin    = 200     # ng/kg/min
+)
+
 scoped_pressors = c(
   "norepinephrine",
   "vasopressin",
@@ -484,6 +495,24 @@ mar[, med_dose := med_dose * dose_mult]
 
 mar[, is_stop := !is.na(mar_action_category) & tolower(mar_action_category) == "stopped"]
 mar[is_stop == TRUE, med_dose := 0]
+
+## implausible doses: delete record (never a stop record; stops are 0) ---------
+
+mar[, dose_limit := dose_limits[agent]]
+
+implausible = mar[
+  !is.na(med_dose) & med_dose > dose_limit,
+  .(n_records = .N, n_encounters = uniqueN(joined_hosp_id)),
+  by = agent
+]
+
+n_implausible = sum(implausible$n_records)
+
+message(sprintf("  Implausible dose records deleted: %d", n_implausible))
+if (n_implausible > 0) print(implausible)
+
+mar = mar[is.na(med_dose) | med_dose <= dose_limit]
+mar[, dose_limit := NULL]
 
 mar_ts = mar[
   ,
