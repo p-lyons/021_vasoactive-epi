@@ -1,7 +1,8 @@
 # ==============================================================================
 # 01_pool_table1.R
-# Vasopressor Escalation in Septic Shock - CLIF Consortium
-# Coordinating Center: Create pooled Table 1 by outcome group
+# Vasopressor Escalation in Refractory Distributive Shock - CLIF Consortium
+# Coordinating site: pooled Table 1 by outcome group
+# Uses site_total rows only (see 00_pool_load.R).
 # ==============================================================================
 
 # Requires: 00_pool_load.R
@@ -133,7 +134,7 @@ calc_anova_pval = function(n_vec, sum_vec, sumsq_vec) {
 
 message("\n== Pooling continuous variables ==")
 
-cont_pooled = continuous_raw[, .(
+cont_pooled = continuous_site[, .(
   n      = sum(n,      na.rm = TRUE),
   n_miss = sum(n_miss, na.rm = TRUE),
   sum    = sum(sum,    na.rm = TRUE),
@@ -148,9 +149,20 @@ cont_pooled[, `:=`(
   sd   = calculate_sd_from_sums(sum, sumsq, n)
 )]
 
-# format as "mean (SD)"
+# format as "mean (SD)"; decimals by variable
+cont_pooled[, digits := fcase(
+  variable == "vw",               0L,
+  variable == "ne_dose_t0",       2L,
+  variable == "max_ne_equiv_48h", 2L,
+  variable == "vp_dose_t0",       3L,
+  default = 1L
+)]
+
 cont_pooled[, formatted := paste0(
-  round(mean, 1), " (", round(sd, 1), ")"
+  sprintf("%.*f", digits, mean),
+  " (",
+  sprintf("%.*f", digits, sd),
+  ")"
 )]
 
 # handle Inf/-Inf from empty groups
@@ -158,7 +170,7 @@ cont_pooled[is.infinite(min), min := NA_real_]
 cont_pooled[is.infinite(max), max := NA_real_]
 cont_pooled[is.nan(mean),     formatted := "—"]
 
-# Calculate p-values (ANOVA across 3 groups)
+# Calculate p-values (ANOVA across outcome groups)
 cont_pvals = cont_pooled[, .(
   pval = calc_anova_pval(n, sum, sumsq)
 ), by = variable]
@@ -171,9 +183,11 @@ message("  Pooled ", uniqueN(cont_pooled$variable), " continuous variables")
 
 message("  Pooling binary variables...")
 
-binary_pooled = binary_raw[, .(
-  n   = sum(n,   na.rm = TRUE),
-  n_1 = sum(n_1, na.rm = TRUE)
+binary_pooled = binary_site[, .(
+  n        = sum(n,   na.rm = TRUE),
+  n_1      = sum(n_1, na.rm = TRUE),
+  n_masked = sum(is.na(n_1)),
+  n_sites  = uniqueN(site)
 ), by = .(outcome_group, variable)]
 
 # calculate percentage (of non-missing)
@@ -182,8 +196,8 @@ binary_pooled[, pct := (n_1 / n) * 100]
 # format as "n/N (pct%)" showing denominator
 binary_pooled[, formatted := format_n_N_pct(n_1, n, pct)]
 
-# handle NA from masking
-binary_pooled[is.na(n_1), formatted := "<5"]
+# masked site cells (1-4) are excluded from n_1: flag as a lower bound
+binary_pooled[n_masked > 0, formatted := paste0(formatted, " *")]
 
 # Calculate p-values (chi-square for binary: success vs failure across groups)
 binary_pvals = binary_pooled[, {
@@ -204,8 +218,9 @@ message("  Pooled ", uniqueN(binary_pooled$variable), " binary variables")
 
 message("  Pooling categorical variables...")
 
-cat_pooled = categorical_raw[, .(
-  n = sum(n, na.rm = TRUE)
+cat_pooled = categorical_site[, .(
+  n        = sum(n, na.rm = TRUE),
+  n_masked = sum(is.na(n))
 ), by = .(outcome_group, variable, category)]
 
 # get group totals for percentages
@@ -220,8 +235,8 @@ cat_pooled[, pct := (n / N) * 100]
 # format as "n (%)" with smart rounding
 cat_pooled[, formatted := format_n_pct(n, pct)]
 
-# handle masked cells
-cat_pooled[is.na(n), formatted := "<5"]
+# masked site cells (1-4) are excluded from n: flag as a lower bound
+cat_pooled[n_masked > 0, formatted := paste0(formatted, " *")]
 
 # Calculate p-values (chi-square: categories x outcome_groups)
 cat_pvals = cat_pooled[, {
@@ -242,7 +257,7 @@ message("  Pooled ", uniqueN(cat_pooled$variable), " categorical variables")
 
 message("  Pooling timing variables...")
 
-timing_pooled = timing_raw[, .(
+timing_pooled = timing_site[, .(
   n   = sum(n,   na.rm = TRUE),
   n_0 = sum(n_0, na.rm = TRUE),
   n_1 = sum(n_1, na.rm = TRUE),
@@ -291,6 +306,8 @@ char_labels = data.table(
     "major_procedure_01",
     "los_to_t0_d",
     "icu_los_to_t0_d",
+    "ne_dose_t0",
+    "vp_dose_t0",
     "imv_at_t0_01",
     "crrt_at_t0_01"
   ),
@@ -310,10 +327,12 @@ char_labels = data.table(
     "Major procedure within 24h of study entry, n/N (%)",
     "Days in hospital before study entry, mean (SD)",
     "Days in ICU before study entry, mean (SD)",
+    "Norepinephrine dose at study entry, mcg/kg/min, mean (SD)",
+    "Vasopressin dose at study entry, units/min, mean (SD)",
     "Invasive mechanical ventilation at study entry, n/N (%)",
     "Continuous renal replacement therapy at study entry, n/N (%)"
   ),
-  sort_order = 1:17,
+  sort_order = 1:19,
   section = "characteristics"
 )
 
@@ -367,13 +386,20 @@ for (col in names(OUTCOME_LABELS)) {
 ## continuous variables wide ---------------------------------------------------
 
 # Filter to only variables we want
-cont_vars_keep = c("age", "vw", "svi_percentile", "adi_percentile", 
-                   "los_to_t0_d", "icu_los_to_t0_d", "los_from_t0_d", "max_ne_equiv_48h")
+cont_vars_keep = c(
+  "age",
+  "vw",
+  "svi_percentile",
+  "adi_percentile",
+  "los_to_t0_d",
+  "icu_los_to_t0_d",
+  "ne_dose_t0",
+  "vp_dose_t0",
+  "los_from_t0_d",
+  "max_ne_equiv_48h"
+)
 
 cont_filtered = cont_pooled[variable %in% cont_vars_keep]
-
-# Special formatting for vw (round to integer)
-cont_filtered[variable == "vw", formatted := paste0(round(mean, 0), " (", round(sd, 0), ")")]
 
 cont_wide = dcast(
   cont_filtered, 
@@ -476,6 +502,36 @@ table1 = table1[!is.na(Variable)]
 message("  Combined Table 1: ", nrow(table1), " rows")
 
 # ==============================================================================
+# FOOTNOTES
+# ==============================================================================
+
+rescue_names = c(
+  mb_01  = "methylene blue",
+  b12_01 = "hydroxocobalamin",
+  a2_01  = "angiotensin II"
+)
+
+if (nrow(NOT_CAPTURED) > 0) {
+  nc_text = NOT_CAPTURED[, .(sites = paste(sort(toupper(site)), collapse = ", ")), by = variable]
+  nc_text[, line := paste0(rescue_names[variable], " (", sites, ")")]
+  note_not_captured = paste0(
+    "Sites with no recorded use were treated as not capturing the agent and excluded from its row: ",
+    paste(nc_text$line, collapse = "; "),
+    "."
+  )
+} else {
+  note_not_captured = character(0)
+}
+
+if (any(binary_pooled$n_masked > 0) || any(cat_pooled$n_masked > 0)) {
+  note_masked = "* Lower bound: one or more site cells of 1-4 were masked and are not included in the count."
+} else {
+  note_masked = character(0)
+}
+
+table_notes = c(note_masked, note_not_captured)
+
+# ==============================================================================
 # CREATE FLEXTABLES
 # ==============================================================================
 
@@ -512,6 +568,11 @@ for (old_name in names(short_headers)) {
   }
 }
 
+if (length(table_notes) > 0) {
+  ft_char = add_footer_lines(ft_char, values = table_notes) |>
+    fontsize(size = 6, part = "footer")
+}
+
 ## Outcomes table --------------------------------------------------------------
 
 ft_outcomes = flextable(table1_outcomes) |>
@@ -531,6 +592,11 @@ for (old_name in names(short_headers)) {
   if (old_name %in% names(table1_outcomes)) {
     ft_outcomes = set_header_labels(ft_outcomes, values = setNames(list(short_headers[old_name]), old_name))
   }
+}
+
+if (length(table_notes) > 0) {
+  ft_outcomes = add_footer_lines(ft_outcomes, values = table_notes) |>
+    fontsize(size = 6, part = "footer")
 }
 
 ## Combined table (for single document) ----------------------------------------
@@ -587,6 +653,11 @@ if (length(outcomes_row) > 0) {
   ft_combined = hline(ft_combined, i = outcomes_row - 1, border = fp_border(width = 0.5), part = "body")
 }
 
+if (length(table_notes) > 0) {
+  ft_combined = add_footer_lines(ft_combined, values = table_notes) |>
+    fontsize(size = 6, part = "footer")
+}
+
 # ==============================================================================
 # SAVE OUTPUTS
 # ==============================================================================
@@ -630,11 +701,21 @@ message("  Saved: table1_data_", today, ".csv")
 
 message("\n== Creating pooled flow diagram ==")
 
-flow_pooled = flow_raw[, .(
+flow_steps = c(
+  "Total encounters meeting T0 criteria",
+  "No escalation + dead/hospice",
+  "Escalated + dead/hospice",
+  "Escalated + alive",
+  "No escalation + alive"
+)
+
+flow_pooled = flow_site[, .(
   n = sum(n, na.rm = TRUE)
 ), by = step]
 
-setorder(flow_pooled, step)
+flow_pooled[, step_order := match(step, flow_steps)]
+setorder(flow_pooled, step_order)
+flow_pooled[, step_order := NULL]
 
 fwrite(flow_pooled, here("output", "tables", paste0("flow_diagram_pooled_", today, ".csv")))
 message("  Saved: flow_diagram_pooled_", today, ".csv")

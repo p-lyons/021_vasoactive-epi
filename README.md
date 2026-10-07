@@ -31,7 +31,11 @@ code/                          site-level pipeline (run at each site)
   03_table.R                   poolable Table 1 and QC summaries, by hospital
   run_all.R                    runs 00 -> 03 in order
   sankey_transitions_onepass.R standalone: state-transition counts for the Sankey figure
-code_for_pooled_data/          coordinating site only: pools site outputs
+code_for_pooled_data/          coordinating site only: pools site outputs (run in order)
+  00_pool_load.R               loads sites/{site}/ files; site_total vs hospital rows; Sankey pooling
+  01_pool_table1.R             pooled Table 1 and flow diagram
+  02_pool_qc.R                 cross-site QC, hospital attribution, Sankey cascade check
+  03_pool_hospital_variation.R hospital ranges (>= 30 encounters) and random-intercept ICC/MOR
 config/
   config_clif_pressors_EXAMPLE.yaml   template for your site config
   clif_sites.csv               valid site names and time zones

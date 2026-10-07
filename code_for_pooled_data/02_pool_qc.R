@@ -1,7 +1,8 @@
 # ==============================================================================
 # 02_pool_qc.R
-# Vasopressor Escalation in Septic Shock - CLIF Consortium
-# Coordinating Center: QC review across sites
+# Vasopressor Escalation in Refractory Distributive Shock - CLIF Consortium
+# Coordinating site: QC review across sites
+# Site-level checks use site_total rows only (see 00_pool_load.R).
 # ==============================================================================
 
 # Requires: 00_pool_load.R
@@ -94,14 +95,18 @@ if (nrow(qc_flags_raw) > 0) {
 }
 
 # ==============================================================================
-# 2. MISSINGNESS COMPARISON
+# 3. MISSINGNESS COMPARISON
 # ==============================================================================
 
 message("\n-- Missingness by site --")
 
 if (nrow(qc_missing_raw) > 0) {
   
-  missing_wide = dcast(qc_missing_raw, variable ~ site, value.var = "pct_miss")
+  missing_wide = dcast(
+    qc_missing_raw[hospital == "site_total"],
+    variable ~ site,
+    value.var = "pct_miss"
+  )
   
   # Calculate mean and flag outliers (>2 SD from mean)
   site_cols = intersect(ALLOWED_SITES, names(missing_wide))
@@ -136,7 +141,7 @@ if (nrow(qc_missing_raw) > 0) {
 }
 
 # ==============================================================================
-# 3. CONTINUOUS VARIABLE RANGES
+# 4. CONTINUOUS VARIABLE RANGES
 # ==============================================================================
 
 message("\n-- Continuous variable ranges --")
@@ -146,8 +151,8 @@ if (nrow(qc_ranges_raw) > 0) {
   # Check for impossible values
   range_checks = list(
     age              = list(min = 18, max = 120, label = "Age"),
-    ne_dose_t0       = list(min = 0,  max = 10,  label = "NE dose at T0"),
-    vp_dose_t0       = list(min = 0,  max = 0.2, label = "VP dose at T0"),
+    ne_dose_t0       = list(min = 0.2, max = 5,   label = "NE dose at T0"),
+    vp_dose_t0       = list(min = 0,   max = 0.5, label = "VP dose at T0"),
     max_ne_equiv_48h = list(min = 0,  max = 20,  label = "Max NE equiv"),
     los_to_t0_d      = list(min = 0,  max = 365, label = "LOS to T0"),
     svi_percentile   = list(min = 0,  max = 1,   label = "SVI"),
@@ -184,7 +189,7 @@ if (nrow(qc_ranges_raw) > 0) {
 }
 
 # ==============================================================================
-# 4. CATEGORICAL VALUE INVENTORY
+# 5. CATEGORICAL VALUE INVENTORY
 # ==============================================================================
 
 message("\n-- Categorical value check --")
@@ -193,7 +198,7 @@ if (nrow(qc_categories_raw) > 0) {
   
   # Check for unexpected categories
   expected_categories = list(
-    outcome_group = c("dead_hospice", "escalated", "stable", "other"),
+    outcome_group = c("noesc_dead", "esc_dead", "esc_alive", "noesc_alive"),
     code_status_t0 = c("full", "dnr_dni", "partial", "other"),
     race_category = c("white", "black or african american", "asian", 
                       "american indian or alaska native", 
@@ -235,20 +240,20 @@ if (nrow(qc_categories_raw) > 0) {
 }
 
 # ==============================================================================
-# 5. CROSS-SITE CONSISTENCY
+# 6. CROSS-SITE CONSISTENCY
 # ==============================================================================
 
 message("\n-- Cross-site consistency --")
 
 ## Check that totals sum correctly ---------------------------------------------
 
-if (nrow(totals_raw) > 0 && nrow(binary_raw) > 0) {
+if (nrow(totals_site) > 0 && nrow(binary_site) > 0) {
   
   # Total N from totals file
-  total_by_site = totals_raw[, .(n_from_totals = sum(n_total)), by = site]
+  total_by_site = totals_site[, .(n_from_totals = sum(n_total)), by = site]
   
   # Total N from binary file (should match)
-  binary_n = binary_raw[variable == "female_01", .(n_from_binary = sum(n)), by = site]
+  binary_n = binary_site[variable == "female_01", .(n_from_binary = sum(n)), by = site]
   
   consistency = merge(total_by_site, binary_n, by = "site", all = TRUE)
   consistency[, diff := n_from_totals - n_from_binary]
@@ -265,13 +270,17 @@ if (nrow(totals_raw) > 0 && nrow(binary_raw) > 0) {
 
 ## Check outcome group proportions ---------------------------------------------
 
-if (nrow(totals_raw) > 0) {
+if (nrow(totals_site) > 0) {
   
-  outcome_props = totals_raw[, .(
+  outcome_props = totals_site[, .(
+    outcome_group,
     pct = n_total / sum(n_total) * 100
-  ), by = .(site, outcome_group)]
+  ), by = site]
   
   outcome_wide = dcast(outcome_props, site ~ outcome_group, value.var = "pct")
+  
+  outcome_wide[, dead_hospice := noesc_dead + esc_dead]
+  outcome_wide[, escalated    := esc_dead + esc_alive]
   
   # Flag sites with unusual distributions
   if ("dead_hospice" %in% names(outcome_wide)) {
@@ -290,17 +299,17 @@ if (nrow(totals_raw) > 0) {
 }
 
 # ==============================================================================
-# 6. SITE COMPARISON TABLE
+# 7. SITE COMPARISON TABLE
 # ==============================================================================
 
 message("\n-- Creating site comparison table --")
 
-if (nrow(continuous_raw) > 0) {
+if (nrow(continuous_site) > 0) {
   
   # Key variables for comparison
-  key_vars = c("age", "vw", "ne_dose_t0", "los_to_t0_d")
+  key_vars = c("age", "vw", "ne_dose_t0", "vp_dose_t0", "los_to_t0_d")
   
-  site_comparison = continuous_raw[variable %in% key_vars, .(
+  site_comparison = continuous_site[variable %in% key_vars, .(
     mean = sum(sum, na.rm = TRUE) / sum(n, na.rm = TRUE),
     n    = sum(n, na.rm = TRUE)
   ), by = .(site, variable)]
@@ -312,12 +321,12 @@ if (nrow(continuous_raw) > 0) {
   fwrite(site_comp_wide, here("output", "qc", paste0("qc_site_comparison_", today, ".csv")))
   
   # Calculate SMDs between each site and pooled
-  pooled_means = continuous_raw[variable %in% key_vars, .(
+  pooled_means = continuous_site[variable %in% key_vars, .(
     pooled_mean = sum(sum, na.rm = TRUE) / sum(n, na.rm = TRUE),
     pooled_sd   = calculate_sd_from_sums(sum(sum), sum(sumsq), sum(n))
   ), by = variable]
   
-  site_means = continuous_raw[variable %in% key_vars, .(
+  site_means = continuous_site[variable %in% key_vars, .(
     site_mean = sum(sum, na.rm = TRUE) / sum(n, na.rm = TRUE),
     site_sd   = calculate_sd_from_sums(sum(sum), sum(sumsq), sum(n))
   ), by = .(site, variable)]
@@ -338,7 +347,7 @@ if (nrow(continuous_raw) > 0) {
 }
 
 # ==============================================================================
-# 7. SITE DIAGNOSTICS DASHBOARD
+# 8. SITE DIAGNOSTICS DASHBOARD
 # ==============================================================================
 
 message("\n-- Site diagnostics dashboard --")
@@ -346,7 +355,11 @@ message("\n-- Site diagnostics dashboard --")
 if (nrow(qc_diagnostics_raw) > 0) {
   
   # Pivot to wide format for easy comparison
-  diag_wide = dcast(qc_diagnostics_raw, metric ~ site, value.var = "value")
+  diag_wide = dcast(
+    qc_diagnostics_raw[hospital == "site_total"],
+    metric ~ site,
+    value.var = "value"
+  )
   
   # Key metrics to flag
   numeric_metrics = c("pct_dead_hospice", "pct_escalated", "pct_svi_linked", 
@@ -385,13 +398,100 @@ if (nrow(qc_diagnostics_raw) > 0) {
   
   # Print summary table
   message("\n  Site diagnostics summary:")
-  print(diag_wide, nrow = 20)
+  print(diag_wide, nrows = 50)
   
   fwrite(diag_wide, here("output", "qc", paste0("qc_diagnostics_summary_", today, ".csv")))
   message("  Saved diagnostics summary")
   
 } else {
   message("  No diagnostics data available")
+}
+
+# ==============================================================================
+# 9. HOSPITAL ATTRIBUTION
+# ==============================================================================
+
+message("\n-- Hospital attribution --")
+
+if (nrow(qc_hospital_raw) > 0) {
+  
+  qc_hospital_raw[, pct_first_hosp_differs := round(n_first_hosp_differs / n_encounters * 100, 1)]
+  
+  # a hospital should be all academic or all community
+  mixed_type = qc_hospital_raw[!is.na(pct_academic) & pct_academic > 0 & pct_academic < 100]
+  
+  if (nrow(mixed_type) > 0) {
+    message("  ⚠️  Hospitals with mixed academic/community type:")
+    print(mixed_type[, .(site, hospital, n_encounters, pct_academic)])
+  } else {
+    message("  ✅ Every hospital has a single hospital type")
+  }
+  
+  unknown_hosp = qc_hospital_raw[hospital == "unknown"]
+  
+  if (nrow(unknown_hosp) > 0) {
+    message("  ⚠️  Encounters with unknown hospital at T0:")
+    print(unknown_hosp[, .(site, n_encounters)])
+  }
+  
+  fwrite(qc_hospital_raw, here("output", "qc", paste0("qc_hospital_summary_", today, ".csv")))
+  message("  Saved hospital attribution summary")
+  
+} else {
+  message("  No hospital attribution data available")
+}
+
+# ==============================================================================
+# 10. RESCUE AGENTS NOT CAPTURED
+# ==============================================================================
+
+message("\n-- Rescue agents not captured --")
+
+if (nrow(NOT_CAPTURED) > 0) {
+  print(NOT_CAPTURED)
+} else {
+  message("  ✅ No site has zero use of a rescue agent")
+}
+
+fwrite(NOT_CAPTURED, here("output", "qc", paste0("qc_rescue_not_captured_", today, ".csv")))
+
+# ==============================================================================
+# 11. SANKEY CASCADE CHECK
+# ==============================================================================
+
+message("\n-- Sankey cascade vs Table 1 cascade --")
+
+if (nrow(CASCADE_CHECK) > 0) {
+  
+  if (any(!CASCADE_CHECK$match)) {
+    message("  ⚠️  Mismatched steps:")
+    print(CASCADE_CHECK[match == FALSE])
+  } else {
+    message("  ✅ Cascades match at every site")
+  }
+  
+  fwrite(CASCADE_CHECK, here("output", "qc", paste0("qc_sankey_cascade_check_", today, ".csv")))
+  
+} else {
+  message("  No Sankey summary data available")
+}
+
+if (nrow(sankey_summary_raw) > 0) {
+  
+  sankey_flags = sankey_summary_raw[, .(
+    site,
+    n_cohort,
+    n_unresolved_excluded,
+    n_lookback_upgrades,
+    n_implausible_doses
+  )]
+  
+  if (any(sankey_flags$n_unresolved_excluded > 0, na.rm = TRUE)) {
+    message("  ⚠️  Sites with unresolved Sankey states (should be 0):")
+    print(sankey_flags[n_unresolved_excluded > 0])
+  }
+  
+  fwrite(sankey_flags, here("output", "qc", paste0("qc_sankey_summary_", today, ".csv")))
 }
 
 # ==============================================================================
@@ -411,5 +511,9 @@ message("    - qc_outcome_proportions_*.csv (outcome rates by site)")
 message("    - qc_site_comparison_*.csv     (key metrics by site)")
 message("    - qc_site_smds_*.csv           (site vs pooled SMDs)")
 message("    - qc_diagnostics_summary_*.csv (site diagnostics dashboard)")
+message("    - qc_hospital_summary_*.csv    (hospital attribution)")
+message("    - qc_rescue_not_captured_*.csv (rescue agents treated as not captured)")
+message("    - qc_sankey_cascade_check_*.csv (Sankey vs Table 1 cascade)")
+message("    - qc_sankey_summary_*.csv      (Sankey settings and flags)")
 
 message("\n== QC Review complete ==")

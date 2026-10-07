@@ -104,13 +104,16 @@ if ("medication_admin_intermittent" %in% names(data_list)) {
   })
   
   if (nrow(mb_raw) > 0) {
-    mb = 
+    mb_window = 
       join(mb_raw, hid_jid_crosswalk, how = "inner", multiple = TRUE) |>
       join(date_frame, how = "inner", multiple = TRUE) |>
       fsubset(admin_dttm > t0_dttm & admin_dttm <= endpoint_dttm) |>
       fsubset(!is.na(med_dose) & med_dose > 0) |>
-      fgroup_by(joined_hosp_id) |>
-      fsummarize(mb_01 = 1L)
+      as.data.table()
+    
+    # one row per encounter; data.table form also works when no rows remain
+    mb = unique(mb_window[, .(joined_hosp_id)])[, mb_01 := 1L]
+    rm(mb_window)
     
     cohort = join(cohort, mb, how = "left", multiple = FALSE)
     rm(mb)
@@ -134,13 +137,16 @@ if ("medication_admin_intermittent" %in% names(data_list)) {
   })
   
   if (nrow(b12_raw) > 0) {
-    b12 = 
+    b12_window = 
       join(b12_raw, hid_jid_crosswalk, how = "inner", multiple = TRUE) |>
       join(date_frame, how = "inner", multiple = TRUE) |>
       fsubset(admin_dttm > t0_dttm & admin_dttm <= endpoint_dttm) |>
       fsubset(!is.na(med_dose) & med_dose > 0) |>
-      fgroup_by(joined_hosp_id) |>
-      fsummarize(b12_01 = 1L)
+      as.data.table()
+    
+    # one row per encounter; data.table form also works when no rows remain
+    b12 = unique(b12_window[, .(joined_hosp_id)])[, b12_01 := 1L]
+    rm(b12_window)
     
     cohort = join(cohort, b12, how = "left", multiple = FALSE)
     rm(b12)
