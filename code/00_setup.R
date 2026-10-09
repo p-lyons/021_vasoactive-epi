@@ -115,6 +115,25 @@ file_type        = tolower(config$file_type)
 tables_location  = config$clif_data_location
 project_location = config$project_location
 
+## validate site time zone (study window is defined in local site time) -------
+
+if (is.null(config$time_zone) || identical(trimws(config$time_zone), "")) {
+  stop(
+    "config is missing 'time_zone' (IANA name, e.g. 'America/Chicago'). ",
+    "Add it to config/config_clif_pressors.yaml.",
+    call. = FALSE
+  )
+}
+
+if (!config$time_zone %in% OlsonNames()) {
+  stop(
+    sprintf("config 'time_zone' is not a valid IANA time zone: '%s'", config$time_zone),
+    call. = FALSE
+  )
+}
+
+site_tz = config$time_zone
+
 ## validate site name ----------------------------------------------------------
 
 if (!(site_lowercase %in% allowed_sites)) {
@@ -147,8 +166,8 @@ if (!dir.exists(paste0(project_location, "/upload_to_box"))) {
 
 ## study dates -----------------------------------------------------------------
 
-start_date = as.POSIXct("2016-01-01", tz = "UTC")
-end_date   = as.POSIXct("2024-12-31", tz = "UTC")
+start_date = as.POSIXct("2016-01-01 00:00:00", tz = site_tz)
+end_date   = as.POSIXct("2024-12-31 23:59:59", tz = site_tz)
 today      = format(Sys.Date(), "%y%m%d")
 
 ## required vital signs for cohort inclusion -----------------------------------

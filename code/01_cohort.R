@@ -241,11 +241,25 @@ cohort_data =
   dplyr::select(
     ends_with("id"), 
     age_at_admission, 
-    discharge_category, 
-    census_block_code,
-    census_block_group_code
-  ) |> 
+    discharge_category,
+    dplyr::any_of(
+      c(
+        "census_block_code",
+        "census_block_group_code"
+      )
+    )
+  ) |>
   dplyr::collect()
+
+## sites may carry only one FIPS field; add the other as NA --------------------
+
+for (fips_col in c("census_block_code", "census_block_group_code")) {
+  if (!fips_col %in% names(cohort_data)) {
+    cohort_data[[fips_col]] = NA_character_
+  }
+  cohort_data[[fips_col]] = trimws(as.character(cohort_data[[fips_col]]))
+}
+rm(fips_col)
 
 hid_dups_source =
   fcount(cohort_data, hospitalization_id) |>

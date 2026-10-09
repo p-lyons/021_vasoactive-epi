@@ -439,15 +439,51 @@ gc()
 
 message("  Adding SVI/ADI...")
 
-## check if census_block_code has usable FIPS data ----------------------------
+## harmonize FIPS fields (sites may carry block, block group, or both) ---------
+# block (15 digits) -> block group = first 12, tract = first 11
+# block group (12 digits) -> tract = first 11
 
-has_fips = "census_block_code" %in% names(cohort) &&
-  !all(is.na(cohort$census_block_code)) &&
-  any(nchar(trimws(as.character(cohort$census_block_code))) >= 11, na.rm = TRUE)
+for (fips_col in c("census_block_code", "census_block_group_code")) {
+  if (!fips_col %in% names(cohort)) {
+    cohort[[fips_col]] = NA_character_
+  }
+  cohort[[fips_col]] = trimws(as.character(cohort[[fips_col]]))
+  cohort[[fips_col]][cohort[[fips_col]] == ""] = NA_character_
+}
+rm(fips_col)
+
+cohort = ftransform(
+  cohort,
+  census_block_group_code = fcoalesce(
+    census_block_group_code,
+    ifelse(
+      nchar(census_block_code) >= 12,
+      substr(census_block_code, 1, 12),
+      NA_character_
+    )
+  )
+)
+
+cohort = ftransform(
+  cohort,
+  census_tract = fcoalesce(
+    ifelse(
+      nchar(census_block_code) >= 11,
+      substr(census_block_code, 1, 11),
+      NA_character_
+    ),
+    ifelse(
+      nchar(census_block_group_code) >= 11,
+      substr(census_block_group_code, 1, 11),
+      NA_character_
+    )
+  )
+)
+
+has_fips = any(!is.na(cohort$census_tract))
 
 if (!has_fips) {
-  message("    ⚠️  No usable FIPS/census_block_code data — SVI/ADI columns set to NA")
-  cohort$census_tract          = NA_character_
+  message("    ⚠️  No usable FIPS data (census_block_code or census_block_group_code) — SVI/ADI columns set to NA")
   cohort$svi_percentile        = NA_real_
   cohort$adi_percentile        = NA_real_
 } else {
@@ -458,11 +494,6 @@ if (!has_fips) {
   
   if (file.exists(svi_file)) {
     svi_list = read_parquet(svi_file)
-    
-    # extract census tract from census_block_code (first 11 digits)
-    cohort = ftransform(cohort,
-                        census_tract = substr(census_block_code, 1, 11)
-    )
     
     cohort = join(cohort, svi_list, on = "census_tract", how = "left", multiple = FALSE)
     
@@ -481,14 +512,6 @@ if (!has_fips) {
   
   if (file.exists(adi_file)) {
     adi_list = read_parquet(adi_file)
-    
-    # extract census block group from census_block_code (first 12 digits)
-    # only if not already present
-    if (!"census_block_group_code" %in% names(cohort) || all(is.na(cohort$census_block_group_code))) {
-      cohort = ftransform(cohort,
-                          census_block_group_code = substr(census_block_code, 1, 12)
-      )
-    }
     
     cohort = join(cohort, adi_list, on = "census_block_group_code", how = "left", multiple = FALSE)
     

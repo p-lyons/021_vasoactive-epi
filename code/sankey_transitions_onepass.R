@@ -78,7 +78,14 @@ fn_cfg = function(k) {
 tables_location  = normalizePath(path.expand(fn_cfg("clif_data_location")), mustWork = FALSE)
 file_type        = tolower(fn_cfg("file_type"))
 site_lowercase   = tolower(fn_cfg("site_lowercase"))
-site_tz          = if (is.null(config$time_zone)) "UTC" else config$time_zone
+site_tz          = fn_cfg("time_zone")
+
+if (!site_tz %in% OlsonNames()) {
+  stop(
+    sprintf("config 'time_zone' is not a valid IANA time zone: '%s'", site_tz),
+    call. = FALSE
+  )
+}
 
 # same folder as the Table 1 files, so sites send one folder
 dir_out = here::here("upload_to_box")
